@@ -47,6 +47,13 @@ std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gc
         // chunk 9543 -> 8034 ms of GPU timeline (-15.8%), wall 739 -> 998 tok/s, and the decoded tokens are
         // byte-identical.  A larger win than anything else in this table.
         {"STRATA_PF_HCDOWN", "1"},
+        // #313's WMMA dense GEMM.  STRATA_PF_GEMM takes the S23 fused path first and this one covers the shapes
+        // that path declines, so both are needed.  Measured on gfx1151 with Qwen3.8-Flash-Next
+        // ROCmFP4-FAST-v2-ple16 (three runs each, wall clock): prompt 943.61 -> 1029.21 tok/s at 8192 tokens
+        // (+9.1%), 910.21 -> 979.96 at 4096 (+7.7%), 1007.51 -> 1064.14 at 32768 (+5.6%); decode unchanged; the
+        // decoded tokens are identical over 128 steps.  It is try-then-fall-through: when
+        // strata_wmma_gemm_f16() declines a shape the call continues to hipBLASLt as before.
+        {"STRATA_WMMA_GEMM", "1"},
         // decode
         {"STRATA_Q8_PACKED", "1"},       // the packed Q8_0 decode layout: +2.3% (S26)
         {"STRATA_Q6_PACKED", "1"},       // the packed Q6_K heads (S26)
