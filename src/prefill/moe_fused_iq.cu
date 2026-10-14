@@ -1079,6 +1079,26 @@ const DevInfo& dev_info() {
             o = 0;
         d.ok = o >= 1;
         d.occ = d.ok ? o : 1;
+        // Diagnostics (STRATA_PF_KERNEL_INFO=1): the register / LDS / occupancy numbers of the two kernels this
+        // model's expert types actually use, so a kernel change has a measured starting point.  gate/up is the
+        // largest single item of the prompt chunk and is latency-bound (waves_per_eu(1)), so its VGPR count and
+        // resident-wave number are what a tile/pipeline change moves.
+        if (std::getenv("STRATA_PF_KERNEL_INFO") != nullptr) {
+            hipFuncAttributes a{};
+            if (hipFuncGetAttributes(&a, reinterpret_cast<const void*>(native_w11_kernel<T_Q4_K, true>)) == hipSuccess)
+                std::fprintf(stderr, "prefill kernel Q4_K gate/up : %d VGPRs, LDS %zu B, max %d threads\n",
+                             a.numRegs, a.sharedSizeBytes, a.maxThreadsPerBlock);
+            if (hipFuncGetAttributes(&a, reinterpret_cast<const void*>(native_w11_kernel<T_Q4_K, true, true, NW_LB>)) ==
+                hipSuccess)
+                std::fprintf(stderr, "prefill kernel Q4_K gate/up ALIAS: %d VGPRs, LDS %zu B, max %d threads\n",
+                             a.numRegs, a.sharedSizeBytes, a.maxThreadsPerBlock);
+            if (hipFuncGetAttributes(&a, reinterpret_cast<const void*>(native_w11_kernel<T_Q4_0_ROCMFP4_FAST, false>)) ==
+                hipSuccess)
+                std::fprintf(stderr, "prefill kernel ROCmFP4 down: %d VGPRs, LDS %zu B, max %d threads\n",
+                             a.numRegs, a.sharedSizeBytes, a.maxThreadsPerBlock);
+            std::fprintf(stderr, "prefill kernel: %d resident blocks per WGP (d.occ), wgp_blocks(d.occ) %d, NW_ROWS %d, WLD %d\n",
+                         d.occ, wgp_blocks(d.occ), NW_ROWS, WLD);
+        }
         cudaGetLastError();
         return d;
     }
@@ -1223,6 +1243,10 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
 #ifdef STRATA_W_NO_OCC
         const bool occ_gu = false, occ_d = false;
 #else
+        // T_Q4_K / T_Q5_K deliberately do NOT take the (W, X1) + ALIAS variant, measured both ways: ALIAS takes
+        // this kernel's LDS from 41472 B to 24832 so a second block fits the WGP's 64 KB, but the extra barrier
+        // costs more than the occupancy returns (gate/up 2572 ms against 2481 ms at 8192 tokens).  And pairing it
+        // with -DSTRATA_W_LB=8 is far worse still (2749-2802 ms): that cap, not ALIAS, is what spills.
         const bool occ_gu = g.gu_type == T_IQ2_XXS || g.gu_type == T_IQ2_XS || g.gu_type == T_IQ2_S ||
                             g.gu_type == T_IQ3_XXS || g.gu_type == T_IQ3_S || g.gu_type == T_IQ4_XS;
         const bool occ_d = g.d_type == T_Q2_0 || g.d_type == T_Q8_0 || g.d_type == T_IQ4_NL;
