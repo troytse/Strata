@@ -25,6 +25,10 @@ GGML_TYPES: dict[int, str] = {
     28: "F64", 29: "IQ1_M", 30: "BF16", 31: "Q4_0_4_4", 32: "Q4_0_4_8", 33: "Q4_0_8_8",
     34: "TQ1_0", 35: "TQ2_0", 36: "IQ4_NL_4_4", 37: "IQ4_NL_4_8", 38: "IQ4_NL_8_8",
     39: "MXFP4", 40: "NVFP4", 41: "Q4_0_8_8", 42: "Q2_0",
+    # ROCmFPX's own types (the ggml this fork builds against); sizes from its gguf-py constants.py.
+    100: "Q4_0_ROCMFP4", 101: "Q4_0_ROCMFP4_FAST", 102: "Q6_0_ROCMFPX", 103: "Q8_0_ROCMFPX",
+    104: "Q3_0_ROCMFPX", 105: "TURBO3_0", 106: "TURBO4_0", 107: "Q2_0_ROCMFPX_LEGACY_AMBIGUOUS",
+    108: "Q4_0_ROCMI4", 109: "Q5_0_ROCMFPX", 110: "Q7_0_ROCMFPX", 111: "Q2_0_ROCMFPX",
 }
 
 # GGUF metadata value type ids
@@ -45,6 +49,12 @@ BLOCK_GEOMETRY: dict[str, tuple[int, int]] = {
     "IQ2_XXS": (256, 66), "IQ2_XS": (256, 74), "IQ3_XXS": (256, 98), "IQ1_S": (256, 50),
     "IQ4_NL": (32, 18), "IQ3_S": (256, 110), "IQ2_S": (256, 82), "IQ4_XS": (256, 136),
     "IQ1_M": (256, 56), "Q2_0": (64, 18), "MXFP4": (32, 17), "NVFP4": (64, 36),
+    # ROCmFPX's own types. 100/101 are ROCmFP4 (dual and single UE4M3 scale); the rest are the
+    # family the same fork carries.
+    "Q4_0_ROCMFP4": (32, 18), "Q4_0_ROCMFP4_FAST": (32, 17), "Q6_0_ROCMFPX": (32, 26),
+    "Q8_0_ROCMFPX": (32, 33), "Q3_0_ROCMFPX": (32, 14),
+    "Q2_0_ROCMFPX_LEGACY_AMBIGUOUS": (32, 10), "Q4_0_ROCMI4": (32, 17),
+    "Q5_0_ROCMFPX": (32, 22), "Q7_0_ROCMFPX": (32, 30), "Q2_0_ROCMFPX": (32, 10),
 }
 
 

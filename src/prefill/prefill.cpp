@@ -2525,13 +2525,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // step named below, a step that took over 250 ms is logged, and a stall's report names the step it is in.
         // Slower (a sync per step); the bytes are the same.
         static const bool step_sync = [] { const char* e = std::getenv("STRATA_PF_STEP_SYNC"); return e && e[0] == '1'; }();
+        // The report threshold is a knob: at 8192 tokens a gfx1151 layer takes ~229 ms, so the fixed 250 ms filtered
+        // every step and the diagnosis printed nothing at all (STRATA_PF_STEP_MIN_MS=50 sees them).
+        static const double step_min_ms = [] {
+            const char* e = std::getenv("STRATA_PF_STEP_MIN_MS");
+            return e != nullptr ? std::atof(e) : 250.0;
+        }();
         auto pf_step = [&](const char* what, int64_t layer) {
             if (!step_sync) return;
             core::progress_at(what, layer, p0);
             const auto ts = Clock::now();
             const cudaError_t a = cudaStreamSynchronize(m.cs), b = cudaStreamSynchronize(m.copy);
             const double ms = ms_since(ts);
-            if (ms > 250.0 || a != cudaSuccess || b != cudaSuccess)
+            if (ms > step_min_ms || a != cudaSuccess || b != cudaSuccess)
                 std::fprintf(stderr, "strata pf-step: chunk from token %lld, layer %lld: %s took %.0f ms (%s / %s)\n",
                              (long long) p0, (long long) layer, what, ms, cudaGetErrorString(a), cudaGetErrorString(b));
         };

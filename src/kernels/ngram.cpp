@@ -152,6 +152,25 @@ void bf16_dequant_row(const uint8_t* row, float* out160) {
     }
 }
 
+// ROCmFPX's Q3_0_ROCMFPX (ggml type 104): 14-byte blocks of 32 three-bit codes packed LSB-first, one UE4M3
+// scale per 16-element half. The scale decode is the one the whole ROCmFPX family uses (ggml/rocmfpx/rocmfpx.c).
+void fp3_rocmfpx_dequant_row(const uint8_t* row, float* out160) {
+    for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) {
+        const uint8_t* blk = row + (size_t) b * 14;
+        const float d0 = strata::rocmfp4_ue4m3_half(blk[12]);
+        const float d1 = strata::rocmfp4_ue4m3_half(blk[13]);
+        for (int i = 0; i < 32; ++i) {
+            const int bit = i * 3, byte = bit >> 3, shift = bit & 7;
+            uint16_t packed = blk[byte];
+            if (shift + 3 > 8) packed |= (uint16_t) blk[byte + 1] << 8;
+            const uint8_t code = (uint8_t) ((packed >> shift) & 7u);
+            const int mag = (int) (code & 3u);
+            const int v = mag == 0 ? 0 : mag == 1 ? 1 : mag == 2 ? 2 : 4;
+            out160[b * 32 + i] = (float) ((code & 4u) ? -v : v) * (i < 16 ? d0 : d1);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------
 // THE FORMAT TABLE (see PleFormatInfo). One entry per table type; the block formats decode 5 blocks of 32.
 namespace {
@@ -162,6 +181,7 @@ void dequant_blocks(const uint8_t* row, float /*scale*/, float* out160) {
 void dequant_iq4_nl(const uint8_t* row, float, float* out160) { iq4nl_dequant_row(row, out160); }
 void dequant_fp8(const uint8_t* row, float scale, float* out160) { fp8_e4m3_dequant_row(row, scale, out160); }
 void dequant_bf16(const uint8_t* row, float, float* out160) { bf16_dequant_row(row, out160); }
+void dequant_rocmfpx_fp3(const uint8_t* row, float, float* out160) { fp3_rocmfpx_dequant_row(row, out160); }
 
 const PleFormatInfo kPleFormats[] = {
     {PleFormat::IQ4_NL, "IQ4_NL", "IQ4_NL", PLE_ROW_BYTES, false, dequant_iq4_nl},
@@ -175,6 +195,9 @@ const PleFormatInfo kPleFormats[] = {
     // BF16 (#586): the checkpoint's own table at full precision, 320-byte rows; self-describing, so no scale and no
     // metadata to trust (tools/ple_fp8_pack.py writes the FP8 form of the same table)
     {PleFormat::BF16, "BF16", "BF16", PLE_ROW_BYTES_BF16, false, dequant_bf16},
+    // ROCmFPX's own 3-bit table format (ggml type 104), 70-byte rows: the n-gram tables of a Qwen4Exp file
+    // quantized with the ROCmFPX ggml this fork builds against.
+    {PleFormat::Q3_0_ROCMFPX, "Q3_0_ROCMFPX", "Q3_0_ROCMFPX", PLE_ROW_BYTES_ROCMFPX_FP3, false, dequant_rocmfpx_fp3},
 };
 constexpr int kPleFormatCount = (int) (sizeof kPleFormats / sizeof kPleFormats[0]);
 }  // namespace

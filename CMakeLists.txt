@@ -1,4 +1,4 @@
-﻿# Strata Engine - top-level build (P1.S1).
+# Strata Engine - top-level build (P1.S1).
 #
 # Targets (phase-1 Ă‚Â§P1.S1): `strata_artifact` (no CUDA dependency), `tests`.  `strata_plan` and the C++
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
@@ -1403,6 +1403,18 @@ if(STRATA_NATIVE_EXPERTS)
     add_test(NAME q8k_quant_parity_avx COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_ISA=avx $<TARGET_FILE:q8k_quant_parity>)
   endif()
   set(_strata_mmq_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
+  # ROCmFP4 (ggml types 100/101) ships only with the ROCmFPX ggml this fork points at through
+  # -DSTRATA_GGML_DIR; a stock llama.cpp checkout has neither the type nor its MMQ instances.
+  if(STRATA_GGML_DIR AND EXISTS "${STRATA_GGML_DIR}/ggml/src/ggml-cuda/template-instances/mmq-instance-q4_0_rocmfp4.cu")
+    list(APPEND _strata_mmq_types q4_0_rocmfp4 q4_0_rocmfp4_fast)
+    # The rest of the ROCmFPX family the same ggml carries (it has no instances for Q5_0/Q7_0_ROCMFPX).
+    foreach(_t q2_0_rocmfpx q3_0_rocmfpx q4_0_rocmi4 q6_0_rocmfpx q8_0_rocmfpx)
+      if(EXISTS "${STRATA_GGML_DIR}/ggml/src/ggml-cuda/template-instances/mmq-instance-${_t}.cu")
+        list(APPEND _strata_mmq_types ${_t})
+      endif()
+    endforeach()
+    set(STRATA_MMQ_ROCMFP4 ON)
+  endif()
   # #296: OrcaRouter Q4_K_S's Q5_0 experts (Q4_K and Q5_1 come with STRATA_MMQ_KQUANTS on CUDA, S5's branch)
   if(STRATA_ORCA_Q4KS_MMQ)
     list(APPEND _strata_mmq_types q5_0)
@@ -1568,6 +1580,9 @@ if(STRATA_NATIVE_EXPERTS)
       PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}"
       PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_definitions(strata_mmq PRIVATE GGML_USE_HIP=1)
+    if(STRATA_MMQ_ROCMFP4)
+      target_compile_definitions(strata_mmq PUBLIC STRATA_MMQ_ROCMFP4=1)
+    endif()
     if(STRATA_MMQ_KQUANTS)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_KQUANTS=1)
     endif()

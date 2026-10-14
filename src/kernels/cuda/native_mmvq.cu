@@ -24,6 +24,7 @@
 // SOFTWARE.
 
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/rocmfp4.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -725,6 +726,37 @@ __device__ __forceinline__ float small_q8_dot(const Q40Block* __restrict__ w,
     return d * (sumi * ds.x - 4 * ds.y);
 }
 
+// ROCmFP4's codes are a signed codebook, so unlike the affine Q4_0/Q5_0 there is no correction term;
+// the 18-byte block's two 16-weight halves carry their own scale and are summed separately.
+__device__ __forceinline__ float small_q8_dot(const RocmFp4Block* __restrict__ w,
+                                              const Q81Block* __restrict__ x, int iqs) {
+    int sumi0 = 0;
+    int sumi1 = 0;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int v = load_int_b2(w->qs, iqs + i);
+        sumi0 = STRATA_DP4A(rocmfp4_codebook_pack4(v & 0x0f0f0f0f),
+                            reinterpret_cast<const int*>(x->qs)[iqs + i], sumi0);
+        sumi1 = STRATA_DP4A(rocmfp4_codebook_pack4((v >> 4) & 0x0f0f0f0f),
+                            reinterpret_cast<const int*>(x->qs)[iqs + i + 4], sumi1);
+    }
+    return __half22float2(x->ds).x * (rocmfp4_scale(w->e[0]) * sumi0 + rocmfp4_scale(w->e[1]) * sumi1);
+}
+
+__device__ __forceinline__ float small_q8_dot(const RocmFp4FastBlock* __restrict__ w,
+                                              const Q81Block* __restrict__ x, int iqs) {
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int v = load_int_b2(w->qs, iqs + i);
+        sumi = STRATA_DP4A(rocmfp4_codebook_pack4(v & 0x0f0f0f0f),
+                           reinterpret_cast<const int*>(x->qs)[iqs + i], sumi);
+        sumi = STRATA_DP4A(rocmfp4_codebook_pack4((v >> 4) & 0x0f0f0f0f),
+                           reinterpret_cast<const int*>(x->qs)[iqs + i + 4], sumi);
+    }
+    return __half22float2(x->ds).x * rocmfp4_scale(w->e) * sumi;
+}
+
 __device__ __forceinline__ float small_q8_dot(const Q50Block* __restrict__ w,
                                              const Q81Block* __restrict__ x, int iqs) {
     int sumi = 0;
@@ -1054,6 +1086,66 @@ struct SmallTraits<Q40Block, 4> {
         }
         const float2 ds = __half22float2(x->ds);
         return r.d * (sumi * ds.x - 4 * ds.y);
+    }
+};
+
+template<>
+struct SmallTraits<RocmFp4Block, 4> {
+    using Block = RocmFp4Block;
+    static constexpr int DIV = 32, T = 2, KBY = 1, BPI = 2 * WARPS * WARP / 4;
+    __device__ static int kqs(int tid) { return 2 * (tid % 2); }
+    struct W { int vi0[2], vi1[2]; float d0, d1; };
+    __device__ static W load(const Block* __restrict__ w, int iqs) {
+        W r;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int v = load_int_b2(w->qs, iqs + i);
+            r.vi0[i] = rocmfp4_codebook_pack4(v & 0x0f0f0f0f);
+            r.vi1[i] = rocmfp4_codebook_pack4((v >> 4) & 0x0f0f0f0f);
+        }
+        r.d0 = rocmfp4_scale(w->e[0]);
+        r.d1 = rocmfp4_scale(w->e[1]);
+        return r;
+    }
+    // The codebook is signed, so no unsigned-offset term as in Q4_0; each 16-weight half has its own scale.
+    __device__ static float apply(const W& r, const Q81Block* __restrict__ x, int iqs) {
+        int sumi0 = 0;
+        int sumi1 = 0;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            sumi0 = STRATA_DP4A(r.vi0[i], reinterpret_cast<const int*>(x->qs)[iqs + i], sumi0);
+            sumi1 = STRATA_DP4A(r.vi1[i], reinterpret_cast<const int*>(x->qs)[iqs + i + 4], sumi1);
+        }
+        const float2 ds = __half22float2(x->ds);
+        return ds.x * (r.d0 * sumi0 + r.d1 * sumi1);
+    }
+};
+
+template<>
+struct SmallTraits<RocmFp4FastBlock, 4> {
+    using Block = RocmFp4FastBlock;
+    static constexpr int DIV = 32, T = 2, KBY = 1, BPI = 2 * WARPS * WARP / 4;
+    __device__ static int kqs(int tid) { return 2 * (tid % 2); }
+    struct W { int vi0[2], vi1[2]; float d; };
+    __device__ static W load(const Block* __restrict__ w, int iqs) {
+        W r;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int v = load_int_b2(w->qs, iqs + i);
+            r.vi0[i] = rocmfp4_codebook_pack4(v & 0x0f0f0f0f);
+            r.vi1[i] = rocmfp4_codebook_pack4((v >> 4) & 0x0f0f0f0f);
+        }
+        r.d = rocmfp4_scale(w->e);
+        return r;
+    }
+    __device__ static float apply(const W& r, const Q81Block* __restrict__ x, int iqs) {
+        int sumi = 0;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            sumi = STRATA_DP4A(r.vi0[i], reinterpret_cast<const int*>(x->qs)[iqs + i], sumi);
+            sumi = STRATA_DP4A(r.vi1[i], reinterpret_cast<const int*>(x->qs)[iqs + i + 4], sumi);
+        }
+        return __half22float2(x->ds).x * r.d * sumi;
     }
 };
 
@@ -2438,6 +2530,26 @@ void native_q4_0_f32(const void* weights, const float* x, void* scratch_q8_1,
     small_f32<Q40Block, 4>(weights, x, scratch_q8_1, y, n_in, n_out, ncols, stream);
 }
 
+void native_rocmfp4_mmvq(const void* weights, const void* x_q8_1, float* y,
+                         int n_in, int n_out, int ncols, void* stream) {
+    small_mmvq<RocmFp4Block, 4>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
+}
+
+void native_rocmfp4_f32(const void* weights, const float* x, void* scratch_q8_1,
+                        float* y, int n_in, int n_out, int ncols, void* stream) {
+    small_f32<RocmFp4Block, 4>(weights, x, scratch_q8_1, y, n_in, n_out, ncols, stream);
+}
+
+void native_rocmfp4_fast_mmvq(const void* weights, const void* x_q8_1, float* y,
+                              int n_in, int n_out, int ncols, void* stream) {
+    small_mmvq<RocmFp4FastBlock, 4>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
+}
+
+void native_rocmfp4_fast_f32(const void* weights, const float* x, void* scratch_q8_1,
+                             float* y, int n_in, int n_out, int ncols, void* stream) {
+    small_f32<RocmFp4FastBlock, 4>(weights, x, scratch_q8_1, y, n_in, n_out, ncols, stream);
+}
+
 void native_q5_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
     small_mmvq<Q50Block, 4>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
@@ -2510,7 +2622,8 @@ bool native_mmvq_supported(int ggml_type) noexcept {
     return ggml_type == 2 || ggml_type == 6 || ggml_type == 7 || ggml_type == 8 || ggml_type == 11 ||
            ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 20 ||
            ggml_type == 23 || ggml_type == 42 || ggml_type == 16 || ggml_type == 17 || ggml_type == 18 ||
-           ggml_type == 21 || ggml_type == 22 || ggml_type == 29;
+           ggml_type == 21 || ggml_type == 22 || ggml_type == 29 || ggml_type == 100 ||
+           ggml_type == 101 || (ggml_type >= 102 && ggml_type <= 111);
 }
 
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
@@ -2527,6 +2640,16 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
     case 14: block_elems = 256; block_bytes = 210; break;
     case 23: block_elems = 256; block_bytes = 136; break;
     case 42: block_elems = 64; block_bytes = 18; break;
+    case 100: block_elems = 32; block_bytes = 18; break;
+    case 101: block_elems = 32; block_bytes = 17; break;
+    case 102: block_elems = 32; block_bytes = 26; break;
+    case 103: block_elems = 32; block_bytes = 33; break;
+    case 104: block_elems = 32; block_bytes = 14; break;
+    case 107: block_elems = 32; block_bytes = 10; break;
+    case 108: block_elems = 32; block_bytes = 17; break;
+    case 109: block_elems = 32; block_bytes = 22; break;
+    case 110: block_elems = 32; block_bytes = 30; break;
+    case 111: block_elems = 32; block_bytes = 10; break;
     case 16: case 17: case 18: case 21: case 22: case 29:
         block_elems = 256; block_bytes = (int) iq_row_bytes(ggml_type, 256); break;
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
@@ -2538,6 +2661,39 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
         throw std::length_error("native MMVQ weight byte count overflows size_t");
     }
     return row_bytes * std::size_t(n_out);
+}
+
+// The rest of the ROCmFPX family (types 102-111): one warp a row, each lane walking its own blocks
+// through the family decoder in strata/kernels/rocmfp4.hpp. Correct for every type; the per-format
+// kernels above are the faster specializations.
+__global__ void rocmfpx_family_kernel(const uint8_t* __restrict__ w, const Q81Block* __restrict__ x,
+                                      float* __restrict__ y, int type, int nb, int bb, int n_out) {
+    const int row = blockIdx.x, col = blockIdx.y;
+    if (row >= n_out) return;
+    const int lane = threadIdx.x;
+    const uint8_t* wr = w + (size_t) row * nb * bb;
+    const Q81Block* xc = x + (size_t) col * nb;
+    float s = 0.0f;
+    for (int b = lane; b < nb; b += WARP) s += rocmfpx_block_dot(type, wr + (size_t) b * bb, xc + b);
+    s = warp_sum(s);
+    if (lane == 0) y[(size_t) col * n_out + row] = s;
+}
+
+void native_rocmfpx_family_mmvq(int type, const void* weights, const void* x_q8_1, float* y,
+                                int n_in, int n_out, int ncols, void* stream) {
+    validate_shape(n_in, ncols, 32);
+    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
+    validate_pointer(weights);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    RocmFpxFormat f{};
+    if (!rocmfpx_format(type, f)) throw std::invalid_argument("not a ROCmFPX family type");
+    const int bb = f.qs_bytes + f.scales, nb = n_in / 32;
+    const dim3 grid((unsigned) n_out, (unsigned) ncols);
+    rocmfpx_family_kernel<<<grid, WARP, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const uint8_t*>(weights), static_cast<const Q81Block*>(x_q8_1), y, type, nb, bb, n_out);
+    launch_check();
 }
 
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
@@ -2554,6 +2710,10 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     case 14: native_q6_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 23: native_iq4_xs_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 42: native_q2_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 100: native_rocmfp4_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 101: native_rocmfp4_fast_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 102: case 103: case 104: case 107: case 108: case 109: case 110: case 111:
+        native_rocmfpx_family_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 16: case 17: case 18: case 21: case 22: case 29:
         iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");

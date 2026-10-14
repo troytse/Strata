@@ -206,6 +206,11 @@ bool supported(int t) {
         case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_Q8_0:   // the draft layer's dense matrices (E-9)
+#ifdef STRATA_MMQ_ROCMFP4
+        case GGML_TYPE_Q4_0_ROCMFP4: case GGML_TYPE_Q4_0_ROCMFP4_FAST:   // the ROCmFPX ggml's 4-bit types
+        case GGML_TYPE_Q2_0_ROCMFPX: case GGML_TYPE_Q3_0_ROCMFPX: case GGML_TYPE_Q6_0_ROCMFPX:
+        case GGML_TYPE_Q8_0_ROCMFPX: case GGML_TYPE_Q4_0_ROCMI4:         // the rest of the family
+#endif
             return true;
 #ifdef STRATA_MMQ_KQUANTS
         // Unsloth's UD-Q4/Q5/Q6_K_XL experts; on HIP also the dense GGUF projections (STRATA_DENSE_MMQ)
@@ -339,7 +344,7 @@ void Context::run(const Product& p, void* stream) {
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
                         p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
                         1, 1, 0, 0, 0,
-                        p.max_rows, p.max_rows};
+                        p.max_rows};
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
     switch (t) {
@@ -355,6 +360,15 @@ void Context::run(const Product& p, void* stream) {
         case GGML_TYPE_IQ4_NL: mul_mat_q_case<GGML_TYPE_IQ4_NL>(ctx, a, s); break;
         case GGML_TYPE_IQ4_XS: mul_mat_q_case<GGML_TYPE_IQ4_XS>(ctx, a, s); break;
         case GGML_TYPE_Q8_0: mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, a, s); break;
+#ifdef STRATA_MMQ_ROCMFP4
+        case GGML_TYPE_Q4_0_ROCMFP4: mul_mat_q_case<GGML_TYPE_Q4_0_ROCMFP4>(ctx, a, s); break;
+        case GGML_TYPE_Q4_0_ROCMFP4_FAST: mul_mat_q_case<GGML_TYPE_Q4_0_ROCMFP4_FAST>(ctx, a, s); break;
+        case GGML_TYPE_Q2_0_ROCMFPX: mul_mat_q_case<GGML_TYPE_Q2_0_ROCMFPX>(ctx, a, s); break;
+        case GGML_TYPE_Q3_0_ROCMFPX: mul_mat_q_case<GGML_TYPE_Q3_0_ROCMFPX>(ctx, a, s); break;
+        case GGML_TYPE_Q6_0_ROCMFPX: mul_mat_q_case<GGML_TYPE_Q6_0_ROCMFPX>(ctx, a, s); break;
+        case GGML_TYPE_Q8_0_ROCMFPX: mul_mat_q_case<GGML_TYPE_Q8_0_ROCMFPX>(ctx, a, s); break;
+        case GGML_TYPE_Q4_0_ROCMI4: mul_mat_q_case<GGML_TYPE_Q4_0_ROCMI4>(ctx, a, s); break;
+#endif
 #if defined(STRATA_MMQ_KQUANTS) && defined(STRATA_KQ_DSO)
         case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: case GGML_TYPE_Q5_1: {
             const int e = kq::run((int) t, &a, s);

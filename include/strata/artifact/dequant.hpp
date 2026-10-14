@@ -94,6 +94,95 @@ inline void dequantize_q4_0(const uint8_t* block, float* out) {
     }
 }
 
+// ---- ROCmFP4 (ggml types 100 and 101, from the ROCmFPX ggml this fork builds against): 32 elements
+// from an 18-byte block with one UE4M3 scale per 16-weight half, or a 17-byte block with one scale.
+// The same nibble order as Q4_0, but the 4-bit code is a signed codebook {0,1,2,3,4,6,8,10} and its
+// negation, and the scale byte is a finite unsigned E4M3 whose value is half the IEEE reading.
+inline float rocmfp4_ue4m3_half(uint8_t e) {
+    if (e > 0x7E) return 0.0f;
+    const int ex = (e >> 3) & 0x0F;
+    const int m = e & 0x07;
+    if (ex == 0) return (float)m * 0x1p-10f;
+    const uint32_t bits = ((uint32_t)(127 + ex - 8) << 23) | ((uint32_t)m << 20);
+    float v;
+    std::memcpy(&v, &bits, sizeof(v));
+    return v;
+}
+
+inline float rocmfp4_code(uint8_t q) {
+    const int mag3 = (int)(q & 0x07);
+    const int mag = mag3 <= 4 ? mag3 : 2 * mag3 - 4;
+    return (float)((q & 0x08) ? -mag : mag);
+}
+
+inline void dequantize_q4_0_rocmfp4(const uint8_t* block, float* out) {
+    const float d0 = rocmfp4_ue4m3_half(block[16]);
+    const float d1 = rocmfp4_ue4m3_half(block[17]);
+    for (int j = 0; j < 16; ++j) {
+        out[j] = rocmfp4_code(block[j] & 0x0F) * d0;
+        out[j + 16] = rocmfp4_code(block[j] >> 4) * d1;
+    }
+}
+
+inline void dequantize_q4_0_rocmfp4_fast(const uint8_t* block, float* out) {
+    const float d = rocmfp4_ue4m3_half(block[16]);
+    for (int j = 0; j < 16; ++j) {
+        out[j] = rocmfp4_code(block[j] & 0x0F) * d;
+        out[j + 16] = rocmfp4_code(block[j] >> 4) * d;
+    }
+}
+
+// ---- The rest of the ROCmFPX family (ggml types 102-111). The block geometry and the code meanings
+// mirror the device decoder in strata/kernels/rocmfp4.hpp; the scale decode above is shared.
+inline bool rocmfpx_geometry(uint32_t t, int& qs_bytes, int& scales, int& bits, int& packing) {
+    switch (t) {
+    case 102: qs_bytes = 24; scales = 2; bits = 6; packing = 0; return true;   // Q6_0_ROCMFPX
+    case 103: qs_bytes = 32; scales = 1; bits = 8; packing = 0; return true;   // Q8_0_ROCMFPX
+    case 104: qs_bytes = 12; scales = 2; bits = 3; packing = 0; return true;   // Q3_0_ROCMFPX
+    case 107: qs_bytes = 8;  scales = 2; bits = 2; packing = 0; return true;   // Q2_0_ROCMFPX_LEGACY_AMBIGUOUS
+    case 108: qs_bytes = 16; scales = 1; bits = 4; packing = 2; return true;   // Q4_0_ROCMI4
+    case 109: qs_bytes = 20; scales = 2; bits = 5; packing = 0; return true;   // Q5_0_ROCMFPX
+    case 110: qs_bytes = 28; scales = 2; bits = 7; packing = 0; return true;   // Q7_0_ROCMFPX
+    case 111: qs_bytes = 8;  scales = 2; bits = 2; packing = 0; return true;   // Q2_0_ROCMFPX
+    default: return false;
+    }
+}
+
+inline int rocmfpx_code_host(uint32_t t, uint8_t code) {
+    switch (t) {
+    case 102: { const int mag = code & 31; return (code & 32) ? -(mag == 0 ? 32 : mag) : mag; }
+    case 103: return (int)(int8_t) code;
+    case 104: { const int mag = code & 3u; const int v = mag == 0 ? 0 : mag == 1 ? 1 : mag == 2 ? 2 : 4;
+                return (code & 4u) ? -v : v; }
+    case 107: case 111: { static const int v[4] = {-4, -1, 1, 4}; return v[code & 3u]; }
+    case 108: { const uint8_t n = code & 0x0f; return (n & 0x08) ? (int) n - 16 : (int) n; }
+    case 109: case 110: { const int b = t == 109 ? 5 : 7, sign = 1 << (b - 1), mag = code & (sign - 1);
+                          return (code & sign) ? -(mag == 0 ? sign : mag) : mag; }
+    case 100: case 101: return rocmfp4_code(code);
+    default: return 0;
+    }
+}
+
+// One block of 32 values. 102-111 here; 100/101 have their own functions above.
+inline void dequantize_rocmfpx_family(uint32_t t, const uint8_t* block, float* out) {
+    int qs_bytes = 0, scales = 0, bits = 0, packing = 0;
+    if (!rocmfpx_geometry(t, qs_bytes, scales, bits, packing)) return;
+    for (int i = 0; i < 32; ++i) {
+        uint8_t code;
+        if (packing == 0) {
+            const int bit = i * bits, byte = bit >> 3, shift = bit & 7;
+            uint16_t packed = block[byte];
+            if (shift + bits > 8) packed |= (uint16_t) block[byte + 1] << 8;
+            code = (uint8_t)((packed >> shift) & ((1u << bits) - 1u));
+        } else {
+            code = (i < 16) ? (uint8_t)(block[i] & 0x0f) : (uint8_t)(block[i - 16] >> 4);
+        }
+        const float d = scales == 1 ? rocmfp4_ue4m3_half(block[qs_bytes])
+                                    : rocmfp4_ue4m3_half(block[qs_bytes + (i < 16 ? 0 : 1)]);
+        out[i] = (float) rocmfpx_code_host(t, code) * d;
+    }
+}
+
 // ---- Q5_0: 32 elements from a 22-byte block. Same nibble layout as Q4_0 plus a 5th bit per element
 // packed in qh[4]; the 32 bits of qh are the high bits of elements 0..31 in order.
 inline void dequantize_q5_0(const uint8_t* block, float* out) {
