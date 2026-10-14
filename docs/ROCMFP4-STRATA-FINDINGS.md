@@ -169,6 +169,21 @@ the 2..8 range measured worse: the compiler does not give back VGPRs, it spills.
 `__syncthreads()` (gate/up runs **40** 64-value stages) and the dependency chain - both need the pipeline
 rearranged, not a knob.
 
+**The barrier is not it, though.** The two halves of the same call have very different stage counts and the
+same rate:
+
+| half | ms | MACs | rate |
+| --- | --- | --- | --- |
+| gate/up (40 stages) | 1683.8 | 1.288e13 | **7.65 TMAC/s** |
+| down (10 stages) | 818.8 | 6.44e12 | **7.87 TMAC/s** |
+
+Four times the barriers, identical throughput. Both use the same `nw_wmma` int8 form, and both run at about
+**half** the rate the S23 dense GEMM's own comment quotes for gfx1151 (30-33 TFLOPS on the 16K-row shapes =
+15-16.5 TMAC/s). What the two expert halves share and the dense GEMM does not is the epilogue: per WMMA,
+`dotf()` (an int32-to-float convert of the accumulator), a `w0[i] * dx` multiply and an FMA, doubled again for
+the `has_min` types - roughly 12 to 16 ALU operations per WMMA. That ratio, not occupancy and not the barrier,
+is where the remaining ~2x would come from, and it is an epilogue rewrite rather than a tile change.
+
 Paths already measured for gate/up, so nobody repeats them:
 
 | path | result |
