@@ -1101,6 +1101,14 @@ const DevInfo& dev_info() {
                              a.numRegs, a.sharedSizeBytes, a.maxThreadsPerBlock);
             std::fprintf(stderr, "prefill kernel: %d resident blocks per WGP (d.occ), wgp_blocks(d.occ) %d, NW_ROWS %d, WLD %d\n",
                          d.occ, wgp_blocks(d.occ), NW_ROWS, WLD);
+            // The occupancy of THESE two kernels, not the IQ2_S probe d.occ came from: that is the number a
+            // tile/LDS change moves.
+            int oq = 0, oa = 0, od = 0;
+            if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&oq, native_w11_kernel<T_Q4_K, true>, NW_THREADS, 0) != hipSuccess) oq = -1;
+            if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&oa, native_w11_kernel<T_Q4_K, true, true, NW_LB>, NW_THREADS, 0) != hipSuccess) oa = -1;
+            if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&od, native_w11_kernel<T_Q4_0_ROCMFP4_FAST, false>, NW_THREADS, 0) != hipSuccess) od = -1;
+            std::fprintf(stderr, "prefill kernel occupancy: Q4_K gate/up %d, its ALIAS variant %d, ROCmFP4 down %d blocks per WGP\n",
+                         oq, oa, od);
         }
         cudaGetLastError();
         return d;
