@@ -202,6 +202,31 @@ WMMA dense path `STRATA_PF_GEMM` already turns on.
   GPU timelines separate cleanly (7955..8039 against 7482..7708 ms) and the wall clock agrees at 4096, 8192 and
   32768 tokens (+7.7%, +9.1%, +5.6%) with identical 128-token output. It is now in the gfx1151 defaults (3d).
   **The lesson is the one already in section 1: quote decode from a 128-token generation.**
+- **A second sweep, of thirty-two variables neither of the earlier sweeps had touched**, found nothing either.
+  Every one was set to 1 against a 7527 ms baseline, GPU timeline, 8192 tokens:
+
+  | variable | ms | | variable | ms |
+  | --- | --- | --- | --- | --- |
+  | `GR_FAST` | 7492 | | `QSA_EARLY_EXIT` | 7517 |
+  | `GR_NORM_FAST` | 7502 | | `QSA_CLUSTER` | 7574 |
+  | `GR_SPLIT` | 7549 | | `QSA_WARP` | 7521 |
+  | `GR_DOWN_MAX4` | 7622 | | `PROMPT_ATTN_Q4` | 7552 |
+  | `GR_V3` | 7743 | | `PROMPT_ATTN_V1` | 7527 |
+  | `GR_UNFUSED` | **9495** | | `SELECT_WMMA` | 7606 |
+  | `HC_Q8` | 7552 | | `GDN_NOY` | 7531 |
+  | `HC_Q8_INJECT` | 7472 | | `GDN_CONVL2` | 7695 |
+  | `HC_SPLIT` | 7613 | | `GDN_SPLIT` | 7587 |
+  | `QFUSE` | 7740 | | `GDN_HEAD` | 7639 |
+  | `QFUSE_HC` | 7638 | | `GDN_KEYHEAD` | 7546 |
+  | `QFUSE_HC_LOCAL` | 7599 | | `GDN_COMMIT_SPLIT` | 7552 |
+  | `FUSE_CONVAB` | 7504 | | `KQ256` | 7551 |
+  | `FUSE_HEAD_GR` | 7495 | | `ROUTER_BLOCK` | 7524 |
+  | `FUSE_HITS` | 7575 | | `HIP_ROUTER_FAST` | 7804 |
+  | `FUSE_WAIT` | 7562 | | `GR_UNFUSED` | (see above) |
+
+  The apparent leader, `HC_Q8_INJECT` at -0.7%, does not survive three runs a side: 7488/7516/7581 without it
+  against 7487/7676/7683 with it. Nothing else is outside a +-50 ms noise band either. **Treat the
+  configuration line as closed** - both the variables that are reachable and the ones that are not.
 - **`STRATA_PF_FUSED_KQ` / `STRATA_PF_FUSED` alone look useless if the expert path is not already on.**
   Measuring them with `PF_FUSED` unset put the experts on MMQ, which dominated the chunk and hid every other
   switch's effect (21397 against 22372 ms, apparently "all useless"). The 6 worthwhile switches were all found
