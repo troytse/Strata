@@ -112,6 +112,41 @@ timer (`STRATA_PREFILL_TIMING=1`) is the better tool and already existed.
 215 GB/s - it is already near the bandwidth wall, not 4x off it. `gemm gate/up` and `gdn` are the two large
 phases left and neither has a runtime knob; getting at them means kernel work.
 
+### 4a. Where the fused expert call goes, and why gate/up cannot be tuned
+
+`STRATA_PF_SPLIT_TIMING=1` splits the one `experts_native()` call into its two kernels:
+
+    gate/up  1683.8 ms      down  818.8 ms      (8192 tokens, 48 layers, cumulative)
+
+A 2:1 split, which is the FLOP ratio. gate/up is the single largest item of the whole prompt chunk (21.6% of
+its 7792 ms timeline). `STRATA_PF_KERNEL_INFO=1` then gives the resources:
+
+    Q4_K gate/up        256 VGPRs (the RDNA3 maximum), LDS 41472 B -> 1 block per WGP
+    Q4_K gate/up ALIAS  256 VGPRs,                     LDS 24832 B -> 2 blocks per WGP
+    ROCmFP4 down        240 VGPRs,                     LDS 24832 B -> 2 blocks per WGP
+
+gate/up is pinned to one resident block because 41472 B leaves no room for a second in the WGP's 64 KB of
+LDS. **But doubling the resident blocks does not help**: the ALIAS variant really does reach two, and gate/up
+was still 3.7% SLOWER with it (2572 against 2481 ms) - the extra barrier costs more than the occupancy returns.
+This kernel is therefore **not occupancy-bound**, and neither the LDS budget nor the VGPR cap is the lever.
+What is left is the per-stage `__syncthreads()` (gate/up runs **40** 64-value stages), the ldmatrix/wmma
+dependency chain, and memory latency - all of which need the pipeline rearranged.
+
+Paths already measured for gate/up, so nobody repeats them:
+
+| path | result |
+| --- | --- |
+| occupancy variant + ALIAS with `-DSTRATA_W_LB=8` | **+68%** (2749-2802 ms) - the VGPR cap spills, not ALIAS |
+| ALIAS alone (`NW_LB=1`) | +3.7% (2572 against 2481), despite occupancy 1 -> 2 |
+| grid factor `STRATA_PF_OCC` 2 against 4 | no difference on the whole chunk (7976 against 7987 ms) |
+| `NW_ROWS` 128 -> 64 (halves the weight-buffer LDS) | does not compile: the ALIAS static_assert wants `kTileRows * 65 * 4 <= 2 * NW_ROWS * WLD`, 64 * 260 > 10240 |
+| `STRATA_PF_OCC_W` 1/2/3/6 | 10140 / 7957 / 8091 / 8005 ms against 8051 - neutral or worse |
+| `STRATA_W_LB` | **a compile-time define, not an environment variable** - passing it as one is a no-op (measured wrong once, corrected) |
+
+`gdn`'s 26.6% is mostly dense GEMM too, not the recurrence: of its 2073 ms the in-projection (`wqkv`) is
+1119 ms and the out-projection (`wo`) 432, with conv+gates 124 and the recurrence 398. Those go through the
+WMMA dense path `STRATA_PF_GEMM` already turns on.
+
 ## 5. What was measured and rejected (do not re-try these)
 
 - **Switches, all neutral or worse:** `GDN_CHUNKED`, `GDN_CP_ASYNC`, `GDN_PIPELINE`, `GDN_REC_HEADS`,
