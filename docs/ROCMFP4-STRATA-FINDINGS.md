@@ -13,11 +13,15 @@ easy to mistake for a configuration effect.
 
 | depth | prefill | official "fast" | vs official | decode | official | vs official | vs ROCmFPX |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 4K | **905 tok/s** | 808.5 | **112%** | **71.91 tok/s** | ~50 | **144%** | 2.24x |
-| 8K | **982 tok/s** | 1159 | 85% | **71.19 tok/s** | 53.14 | **134%** | 2.51x |
-| 32K | **1021 tok/s** | 1290 | 79% | **67.72 tok/s** | 50.91 | **133%** | 3.13x |
+| 4K | **959.78 tok/s** | 808.5 | **119%** | **66.21 tok/s** | ~50 | **132%** | 2.37x |
+| 8K | **1038.78 tok/s** | 1159 | **90%** | **65.45 tok/s** | 53.14 | **123%** | 2.66x |
+| 32K | **1066.27 tok/s** | 1290 | **83%** | **64.65 tok/s** | 50.91 | **127%** | 3.27x |
 
-Initial decode was **5.80 tok/s**; it is 67.7-71.9 now, about 12x.
+Three runs each. Decode is quoted from a **128-token** generation; a 256-token one reads a few percent higher
+and a 32-token one 6-10% lower, because the warm-up is a fixed cost - enough to turn a 6% configuration effect
+into a wrong answer, which is how `STRATA_WMMA_GEMM` came to be rejected once (section 5).
+
+Initial decode was **5.80 tok/s**.
 
 The initial 5.8 tok/s was three stacked configuration errors, not ROCmFP4:
 
@@ -35,8 +39,12 @@ export STRATA_PF_FUSED_FPX=1    # ROCmFPX down coverage (new code, see 3)
 export STRATA_PF_GEMM=1         # WMMA dense GEMM instead of hipBLASLt      -45% of the chunk
 export STRATA_HIP_WMMA=1        # prompt attention on matrix cores          -6.3%
 export STRATA_HC_UPMIX=1        # hyper-connection upmix                    -6.5%
-# gfx1151's default table now also carries STRATA_PF_HCDOWN (see 3)        -16%
+# gfx1151's default table now also carries STRATA_PF_HCDOWN (see 3b)       -16%
+# and #313's STRATA_WMMA_GEMM (see 3d)                          +5.6..+9.1%
 ```
+
+`STRATA_PF_GEMM` and `STRATA_WMMA_GEMM` are **both** needed: the S23 fused path runs first and returns, and
+the WMMA one covers the shapes that path declines, falling through to hipBLASLt when it declines them too.
 
 Also required, and outside the switches: `--ple-io mmap` (page cache; `direct` costs 23% of decode),
 `--expert-cache auto`, `--mtp <rt dir>`, `--mtp-draft-vocab data/draft_vocab.bin` (+6.7% decode),
@@ -95,6 +103,22 @@ The output stays byte-identical, so it belongs in the defaults; reverse control 
 `STRATA_PF_STEP_SYNC`'s report threshold was a hard 250 ms. At 8192 tokens a gfx1151 layer takes ~229 ms, so
 **every step was filtered and the diagnosis printed nothing at all**. The threshold is now a knob; the phase
 timer (`STRATA_PREFILL_TIMING=1`) is the better tool and already existed.
+
+### 3d. `src/core/arch_defaults.cpp` - `STRATA_WMMA_GEMM=1` in the gfx1151 defaults (+5.6..+9.1%)
+
+`Gemm::native`'s HIP path tries, in order: the S23 fused prompt GEMM (`STRATA_PF_GEMM`), then #313's WMMA GEMM
+(`STRATA_WMMA_GEMM`), then `f16_inplace`, then hipBLASLt. The first one returns when it handles the shape, so
+the second covers what it declines - which is why both are needed and why turning the second on is worth
+another 5.6-9.1% *on top of* `PF_GEMM`. It is try-then-fall-through, so it cannot make an unsupported shape
+fail.
+
+    prompt @4096   910.21 -> 979.96 tok/s   (+7.7%)
+    prompt @8192   943.61 -> 1029.21 tok/s  (+9.1%)
+    prompt @32768 1007.51 -> 1064.14 tok/s  (+5.6%)
+    decode         unchanged            decoded tokens identical over 128 steps
+
+Reverse control with `STRATA_GFX1151_DEFAULTS=0`: 732.40 / 744.97 tok/s at 8192 against 1026.84 / 1033.74 /
+1029.65 with the table.
 
 ## 4. The phase breakdown at 8192 tokens (GPU timeline 7792 ms)
 
@@ -170,11 +194,14 @@ WMMA dense path `STRATA_PF_GEMM` already turns on.
   `DENSE_MMQ`, `ORCA_Q4KS_MMQ` (compile-time, Q5_0 only), `--no-prefill-borrow`, `--prefill` 4096/8192/16384/32768,
   the hipBLASLt tuning table, `--kv k8v4` / `q4_0`, `--mtp-window` 2048/8192/16384, `--mtp-hnorm` pooled,
   spec 3/5/6/8, `--spec-min-p` 0.2-0.6, `--ple-io direct`.
-- **Two "speedups" that are wrong and must not be enabled:**
-  - `STRATA_HIP_PROMPT_F16=1` is 7% faster on the GPU timeline and **degrades the output** to
-    `220 735 220 735 ...`.
-  - `STRATA_WMMA_GEMM=1` shows -6.6% on the GPU timeline but a worse and far more variable wall clock
-    (800-1042 against 1002-1015). Per this project's own rule, wall clock decides: rejected.
+- **One "speedup" that is wrong and must not be enabled:** `STRATA_HIP_PROMPT_F16=1` is 7% faster on the GPU
+  timeline and **degrades the output** to `220 735 220 735 ...`.
+- **`STRATA_WMMA_GEMM` was rejected once and should not have been.** The disqualifying measurement ran with
+  `--max-new 16`, and at that length the difference read as -6.6% on the GPU timeline but a *worse and far more
+  variable* wall clock (800-1042 against 1002-1015). Re-measured at `--max-new 64` with five runs a side, the
+  GPU timelines separate cleanly (7955..8039 against 7482..7708 ms) and the wall clock agrees at 4096, 8192 and
+  32768 tokens (+7.7%, +9.1%, +5.6%) with identical 128-token output. It is now in the gfx1151 defaults (3d).
+  **The lesson is the one already in section 1: quote decode from a 128-token generation.**
 - **`STRATA_PF_FUSED_KQ` / `STRATA_PF_FUSED` alone look useless if the expert path is not already on.**
   Measuring them with `PF_FUSED` unset put the experts on MMQ, which dominated the chunk and hid every other
   switch's effect (21397 against 22372 ms, apparently "all useless"). The 6 worthwhile switches were all found
