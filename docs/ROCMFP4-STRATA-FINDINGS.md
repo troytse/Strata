@@ -11,7 +11,24 @@ All numbers below are wall clock on this machine unless a GPU timeline is named,
 Decode is quoted from a **256-token** generation; a 32-token one reads 6-10% lower because of warm-up, which is
 easy to mistake for a configuration effect.
 
-The reference numbers below come from **two places, and they must be matched by context depth** - an earlier
+**But the prompt matters far more than the length, and every decode number below was measured on the wrong
+kind of text.** The bench prompts in this session (`p-tail-*.txt`) repeat one 1024-token tail at every depth,
+and repeated text is exactly what a draft layer predicts well.  On the same model, same configuration, same
+depth, same 256-token generation:
+
+| prompt | decode |
+| --- | --- |
+| `p-tail-8192.txt` (one tail, repeated) | **70.91 / 70.97 tok/s** |
+| `prompt-real-8192.txt` (ordinary prose) | **43.38 / 43.44 tok/s** |
+
+A 39% difference, entirely from the text.  **The realistic figure at 8192 tokens is 43.4 tok/s, not 71.**  The
+same caveat applies to the same-model table further down: the 88.75 tok/s measured there was on the repetitive
+prompt too.  A `--spec` sweep on the realistic prompt (2 / 3 / 4 / 6, and `--spec-min-p` 0.15 / 0.35 / 0.60)
+puts the current `--spec 4 --spec-min-p 0.35` at the top - 43.70 against 41.56 / 42.64 / 42.34 / 42.79 / 41.11
+- so the decode configuration is already at its optimum and acceptance is the limit.  Dropping
+`--lookup-chain` costs 5 tok/s.
+
+**The reference numbers also come from "two places, and they must be matched by context depth"** - an earlier
 pass of this document compared its 32K against the maintainers' **128K** figure by mistake and understated the
 result by 8 points:
 
