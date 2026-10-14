@@ -311,6 +311,28 @@ int main(int argc, char ** argv) {
                             1280, 2560, synthetic_of_type(type, 1, 1280, 2560, 5), counts,
                             make_activations(rows, 2560, 77), src, dst);
             }
+#ifdef STRATA_MMQ_ROCMFP4
+            // The ROCmFP4 instances a build over the ROCmFPX ggml adds (CMakeLists: STRATA_MMQ_ROCMFP4).
+            for (const auto & [name, type] : std::initializer_list<std::pair<const char *, ggml_type>>{
+                     {"Q4_0_ROCMFP4", GGML_TYPE_Q4_0_ROCMFP4},
+                     {"Q4_0_ROCMFP4_FAST", GGML_TYPE_Q4_0_ROCMFP4_FAST},
+                     {"Q2_0_ROCMFPX", GGML_TYPE_Q2_0_ROCMFPX},
+                     {"Q3_0_ROCMFPX", GGML_TYPE_Q3_0_ROCMFPX},
+                     {"Q6_0_ROCMFPX", GGML_TYPE_Q6_0_ROCMFPX},
+                     {"Q8_0_ROCMFPX", GGML_TYPE_Q8_0_ROCMFPX},
+                     {"Q4_0_ROCMI4", GGML_TYPE_Q4_0_ROCMI4}}) {
+                if (!supported((int) type)) {
+                    std::cout << "synthetic-" << name << " skipped: not built\n";
+                    continue;
+                }
+                const int rows = 5;
+                const std::vector<int> counts{rows};
+                const auto src = permutation(rows, 3, false), dst = permutation(rows, 2, true);
+                run_product(ctx, stream, std::string("synthetic-") + name, type,
+                            1280, 2560, synthetic_of_type(type, 1, 1280, 2560, 5), counts,
+                            make_activations(rows, 2560, 79), src, dst);
+            }
+#endif
             if (argc == 2) run_real_iq3_first_expert(ctx, stream, argv[1]);
         }
         hip_check(hipStreamSynchronize(stream), "final synchronize");

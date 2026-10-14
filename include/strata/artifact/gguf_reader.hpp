@@ -112,6 +112,24 @@ inline const char* ggml_type_name(uint32_t t) {
         return "Q1_0";
     case 42:
         return "Q2_0";
+    case 100:
+        return "Q4_0_ROCMFP4";
+    case 101:
+        return "Q4_0_ROCMFP4_FAST";
+    case 102:
+        return "Q6_0_ROCMFPX";
+    case 103:
+        return "Q8_0_ROCMFPX";
+    case 104:
+        return "Q3_0_ROCMFPX";
+    case 108:
+        return "Q4_0_ROCMI4";
+    case 109:
+        return "Q5_0_ROCMFPX";
+    case 110:
+        return "Q7_0_ROCMFPX";
+    case 111:
+        return "Q2_0_ROCMFPX";
     default:
         return "?";
     }
@@ -133,6 +151,46 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 2:
         elems = 32;
         bytes = 18;
+        return true;
+    case 100:
+        elems = 32;
+        bytes = 18;
+        return true;
+    case 101:
+        elems = 32;
+        bytes = 17;
+        return true;
+    case 102:
+        elems = 32;
+        bytes = 26;
+        return true;
+    case 103:
+        elems = 32;
+        bytes = 33;
+        return true;
+    case 104:
+        elems = 32;
+        bytes = 14;
+        return true;
+    case 107:
+        elems = 32;
+        bytes = 10;
+        return true;
+    case 108:
+        elems = 32;
+        bytes = 17;
+        return true;
+    case 109:
+        elems = 32;
+        bytes = 22;
+        return true;
+    case 110:
+        elems = 32;
+        bytes = 30;
+        return true;
+    case 111:
+        elems = 32;
+        bytes = 10;
         return true;
     case 3:
         elems = 32;

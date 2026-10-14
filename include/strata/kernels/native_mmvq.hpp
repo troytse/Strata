@@ -84,6 +84,21 @@ void native_q4_0_mmvq(const void* weights, const void* x_q8_1, float* y,
 void native_q4_0_f32(const void* weights, const float* x, void* scratch_q8_1,
                       float* y, int n_in, int n_out, int ncols, void* stream);
 
+// ROCmFP4 (ggml type 100 Q4_0_ROCMFP4 and 101 Q4_0_ROCMFP4_FAST, from the ROCmFPX ggml this fork
+// builds against): 32 elements per block, 18 bytes with one UE4M3 scale per 16-weight half, or
+// 17 bytes with one scale for the whole block.
+void native_rocmfp4_mmvq(const void* weights, const void* x_q8_1, float* y,
+                         int n_in, int n_out, int ncols, void* stream);
+
+void native_rocmfp4_f32(const void* weights, const float* x, void* scratch_q8_1,
+                        float* y, int n_in, int n_out, int ncols, void* stream);
+
+void native_rocmfp4_fast_mmvq(const void* weights, const void* x_q8_1, float* y,
+                              int n_in, int n_out, int ncols, void* stream);
+
+void native_rocmfp4_fast_f32(const void* weights, const float* x, void* scratch_q8_1,
+                             float* y, int n_in, int n_out, int ncols, void* stream);
+
 void native_q5_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream);
 

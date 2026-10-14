@@ -21,6 +21,8 @@
 // (SwiGLU, H to int8 per 32 features; down into the per-slot rows) are moe_fused.cu's.
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/kernels/gfx_arch.hpp"
+#include <cuda_runtime.h>              // rocmfp4.hpp's device helpers need the runtime's __forceinline__/__uint_as_float
+#include "strata/kernels/rocmfp4.hpp"   // the ROCmFPX family's codebook and UE4M3 scale (the down experts)
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -69,7 +71,11 @@ constexpr int T_IQ2_XXS = GGML_TYPE_IQ2_XXS, T_IQ2_XS = GGML_TYPE_IQ2_XS, T_IQ2_
               //   sum w x = d_x (d_w sum q a + m_w sum a):
               // the activation blocks carry sum a per 32 values in their eight spare bytes (quant_act_nat_kernel and
               // the H epilogue write it for every path; no other format reads it)
-              T_Q4_K = GGML_TYPE_Q4_K, T_Q5_K = GGML_TYPE_Q5_K, T_Q5_1 = GGML_TYPE_Q5_1, T_Q8_0 = GGML_TYPE_Q8_0;
+              T_Q4_K = GGML_TYPE_Q4_K, T_Q5_K = GGML_TYPE_Q5_K, T_Q5_1 = GGML_TYPE_Q5_1, T_Q8_0 = GGML_TYPE_Q8_0,
+              // The ROCmFPX family's 4-bit down projections (STRATA_PF_FUSED_FPX=1; op from rocmfp4.hpp).  A
+              // 32-value block with a UE4M3 scale, so it sits in the down slot exactly like IQ4_NL: the same
+              // (2 s + uj) block addressing, only BS and the decode differ.
+              T_Q4_0_ROCMFP4 = GGML_TYPE_Q4_0_ROCMFP4, T_Q4_0_ROCMFP4_FAST = GGML_TYPE_Q4_0_ROCMFP4_FAST;
 static_assert(sizeof(block_iq2_xxs) == 66 && sizeof(block_iq2_xs) == 74 && sizeof(block_iq2_s) == 82 &&
               sizeof(block_iq3_xxs) == 98 && sizeof(block_iq3_s) == 110 && sizeof(block_iq4_xs) == 136 &&
               sizeof(block_iq4_nl) == 18 && sizeof(block_q2_0) == 18 && sizeof(block_q4_K) == 144 &&
@@ -79,12 +85,17 @@ static_assert(sizeof(block_iq2_xxs) == 66 && sizeof(block_iq2_xs) == 74 && sizeo
 // block bytes, scale per 16 values, codebook bytes in shared memory
 __host__ __device__ constexpr int block_bytes(int t) {
     return t == T_IQ2_XXS ? 66 : t == T_IQ2_XS ? 74 : t == T_IQ2_S ? 82 : t == T_IQ3_XXS ? 98 : t == T_IQ3_S ? 110
-         : t == T_IQ4_XS ? 136 : t == T_Q4_K ? 144 : t == T_Q5_K ? 176 : t == T_Q5_1 ? 24 : t == T_Q8_0 ? 34 : 18;
+         : t == T_IQ4_XS ? 136 : t == T_Q4_K ? 144 : t == T_Q5_K ? 176 : t == T_Q5_1 ? 24 : t == T_Q8_0 ? 34
+         : t == T_Q4_0_ROCMFP4_FAST ? 17 : 18;
 }
 // the formats with a minimum (w = d q + m), and the raw words a sub-block's load stage holds
 __host__ __device__ constexpr bool has_min(int t) { return t == T_Q4_K || t == T_Q5_K || t == T_Q5_1; }
 __host__ __device__ constexpr int raw_words(int t) {
     return t == T_Q4_K ? 10 : t == T_Q5_K ? 18 : t == T_Q5_1 ? 6 : t == T_Q8_0 ? 9 : 5;
+}
+// the formats whose down rows carry a sub-block per thread pair (2 s + uj), like IQ4_NL's 32-value blocks
+__host__ __device__ constexpr bool d_pair(int t) {
+    return t == T_IQ4_NL || t == T_Q5_1 || t == T_Q8_0 || t == T_Q4_0_ROCMFP4 || t == T_Q4_0_ROCMFP4_FAST;
 }
 __host__ __device__ constexpr bool per16(int t) { return t == T_IQ2_XS || t == T_IQ2_S; }
 __host__ __device__ constexpr int grid_bytes(int t) {
@@ -261,6 +272,15 @@ template <int T, int NW> __device__ __forceinline__ void load_unit(const uint8_t
 #pragma unroll
         for (int k = 0; k < 4; ++k) w[k] = ld32(bp + 2 + 4 * k);
         w[4] = ld16(bp);
+    } else if constexpr (T == T_Q4_0_ROCMFP4 || T == T_Q4_0_ROCMFP4_FAST) {
+        // qs[16] then the scale byte(s): one UE4M3 for the whole block (FAST) or one per 16 values.
+        // Q4_0_ROCMFP4_FAST's block is 17 bytes, so its sub-blocks land on ODD addresses - the byte-wise load
+        // is required here, ld16() dereferences a uint16_t and every other format's BS is even.
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+            w[k] = (uint32_t) bp[4 * k] | ((uint32_t) bp[4 * k + 1] << 8) |
+                   ((uint32_t) bp[4 * k + 2] << 16) | ((uint32_t) bp[4 * k + 3] << 24);
+        w[4] = (uint32_t) bp[16] | ((uint32_t) bp[(T == T_Q4_0_ROCMFP4_FAST ? 16 : 17)] << 8);
     } else if constexpr (T == T_Q4_K || T == T_Q5_K) {
         // qs: 32 bytes of the sub-block pair (ib / 2), the nibble chosen in convert; w[8] = d | dmin << 16; w[9]: the
         // scale/min bytes (get_scale_min_k4's: ib < 4: sc[ib], sc[ib + 4]; else sc[ib + 4], sc[ib - 4], sc[ib]), ib << 24
@@ -398,6 +418,19 @@ __device__ __forceinline__ void convert(const uint32_t (&w)[NW], const uint8_t* 
 #pragma unroll
         for (int k = 0; k < 4; ++k) table16(w[k], kv, q[k], q[4 + k]);
         s0 = s1 = T == T_IQ4_XS ? half_at(w[4]) * (float) ((int) (w[4] >> 16) - 32) : half_at(w[4]);
+    } else if constexpr (T == T_Q4_0_ROCMFP4 || T == T_Q4_0_ROCMFP4_FAST) {
+        // The split-halves nibble: element j (0..15) is the low nibble of qs[j], element 16 + j the high nibble
+        // (rocmfpx_block_code's convention in strata/kernels/rocmfp4.hpp).  The codes are the family's signed
+        // 16-value codebook, the scales UE4M3 - one for the block (FAST), or one per 16 values.  rocmfp4_scale
+        // already returns the float the dot multiplies by.
+        // NOTE: BOTH launch paths must dispatch this type (native_w11_kernel's STRATA_NW_D chain too); missing it
+        // there silently reads the 17-byte block as IQ4_NL's 18 and decodes the whole model to zeros.
+#pragma unroll
+        for (int k = 0; k < 4; ++k) q[k] = (uint32_t) strata::kernels::rocmfp4_codebook_pack4(w[k] & 0x0f0f0f0fu);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) q[4 + k] = (uint32_t) strata::kernels::rocmfp4_codebook_pack4((w[k] >> 4) & 0x0f0f0f0fu);
+        s0 = strata::kernels::rocmfp4_scale((uint8_t) (w[4] & 0xff));
+        s1 = T == T_Q4_0_ROCMFP4_FAST ? s0 : strata::kernels::rocmfp4_scale((uint8_t) ((w[4] >> 8) & 0xff));
     } else {   // Q2_0: code - 1 via a byte table {-1, 0, 1, 2}
 #pragma unroll
         for (int h = 0; h < 4; ++h) {
@@ -480,7 +513,7 @@ native_kernel(const Batch b, const NativeGeom geo, const Tables tb, const uint8_
                                  : blob + geo.down_off + (size_t) (rbase + ur) * geo.d_row;
         auto unit = [&](int s) -> const uint8_t* {                  // the block of stage s's sub-block
             if (GU) return wrow + (s >> 2) * BS;
-            return WT == T_IQ4_NL ? wrow + (2 * s + uj) * BS : wrow + s * BS;
+            return d_pair(WT) ? wrow + (2 * s + uj) * BS : wrow + s * BS;
         };
         auto sub = [&](int s) { return GU ? 2 * (s & 3) + uj : uj; };
         // the weight bytes into L2 ahead of the register loads (one stage ahead only - less than a DRAM round trip):
@@ -763,7 +796,7 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
                                  : blob + geo.down_off + (size_t) (rbase + ur) * geo.d_row;
         auto unit = [&](int s) -> const uint8_t* {
             if (GU) return wrow + (s >> 2) * BS;
-            return (WT == T_IQ4_NL || WT == T_Q5_1 || WT == T_Q8_0) ? wrow + (2 * s + uj) * BS : wrow + s * BS;
+            return d_pair(WT) ? wrow + (2 * s + uj) * BS : wrow + s * BS;
         };
         auto sub = [&](int s) { return GU ? 2 * (s & 3) + uj : uj; };
         auto put = [&](const uint32_t (&raw)[raw_words(WT)], int buf) {
@@ -1073,6 +1106,16 @@ bool kq_on() {
     }();
     return on;
 }
+
+// opt-in on top of STRATA_PF_FUSED=1: STRATA_PF_FUSED_FPX=1 takes the ROCmFPX family's 4-bit down rows (the packs
+// whose experts mix a K-quant gate/up with Q4_0_ROCMFP4 / _FAST down).  Same gate as STRATA_PF_FUSED_KQ.
+bool fpx_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PF_FUSED_FPX");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
 bool gu_covered(int t) {
     return t == T_IQ2_XXS || t == T_IQ2_XS || t == T_IQ2_S || t == T_IQ3_XXS || t == T_IQ3_S || t == T_IQ4_XS
 #if defined(__HIPCC__)
@@ -1084,6 +1127,10 @@ bool d_covered(int t) {
     return t == T_Q2_0 || t == T_IQ4_NL
 #if defined(__HIPCC__)
            || ((t == T_Q5_1 || t == T_Q8_0) && kq_on())
+           // The ROCmFPX family's 4-bit down rows, opt-in (STRATA_PF_FUSED_FPX=1): the decode is verified against
+           // ggml's own to_float and the MMQ path by hip_prefill_mmq_parity, but it is a new kernel path, so the
+           // default stays on MMQ until it has a measured win.
+           || ((t == T_Q4_0_ROCMFP4 || t == T_Q4_0_ROCMFP4_FAST) && fpx_on())
 #endif
         ;
 }
@@ -1135,7 +1182,19 @@ bool native_supported(int gu_type, int d_type) {
     if (env < 0 && gu_type != T_IQ3_S && gu_type != T_IQ3_XXS) return false;   // default: only these two
     const DevInfo& d = dev_info();
     if (env < 0) return d.ok && d.w12;
-    return d.ok && (requested() || d.w12);
+    const bool ok = d.ok && (requested() || d.w12);
+#if defined(__HIPCC__)
+    // self-verification for the opt-in (a path this new must prove it ran, not just that the output matched)
+    if (ok && (d_type == T_Q4_0_ROCMFP4 || d_type == T_Q4_0_ROCMFP4_FAST) && fpx_on()) {
+        static bool once = false;
+        if (!once) {
+            once = true;
+            std::fprintf(stderr, "prefill fused iq: the ROCmFPX down rows on the fused path (STRATA_PF_FUSED_FPX=1), gate/up %d, down %d, %d bits\n",
+                         gu_type, d_type, d_type == T_Q4_0_ROCMFP4_FAST ? 17 : 18);
+        }
+    }
+#endif
+    return ok;
 }
 
 void quantize_act_native(const float* x, int64_t rows, int64_t cols, void* xa, void* stream) {
@@ -1192,6 +1251,8 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
 #undef STRATA_NW_GU
 #define STRATA_NW_D(T) do { if (occ_d) native_w11_kernel<T, false, true, NW_LB><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); else native_w11_kernel<T, false><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); } while (0)
         if (g.d_type == T_Q2_0) STRATA_NW_D(T_Q2_0);
+        else if (g.d_type == T_Q4_0_ROCMFP4_FAST) STRATA_NW_D(T_Q4_0_ROCMFP4_FAST);
+        else if (g.d_type == T_Q4_0_ROCMFP4) STRATA_NW_D(T_Q4_0_ROCMFP4);
         else if (g.d_type == T_Q5_1) STRATA_NW_D(T_Q5_1);
         else if (g.d_type == T_Q8_0) STRATA_NW_D(T_Q8_0);
         else STRATA_NW_D(T_IQ4_NL);
@@ -1215,6 +1276,8 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
         default: launch<T_IQ4_XS, true>(ww, g_gu, b, g, tb, xa, src, ha, nullptr, s); break;
     }
     if (g.d_type == T_Q2_0) launch<T_Q2_0, false>(ww, g_d, b, g, tb, ha, src, nullptr, dm, s);
+    else if (g.d_type == T_Q4_0_ROCMFP4_FAST) launch<T_Q4_0_ROCMFP4_FAST, false>(ww, g_d, b, g, tb, ha, src, nullptr, dm, s);
+    else if (g.d_type == T_Q4_0_ROCMFP4) launch<T_Q4_0_ROCMFP4, false>(ww, g_d, b, g, tb, ha, src, nullptr, dm, s);
     else launch<T_IQ4_NL, false>(ww, g_d, b, g, tb, ha, src, nullptr, dm, s);
     ck(cudaGetLastError(), "experts_native");
 }

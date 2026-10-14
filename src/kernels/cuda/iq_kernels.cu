@@ -7,6 +7,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
+#include "strata/kernels/rocmfp4.hpp"
 #include "s26_tsum.cuh"
 
 #include <cuda_fp16.h>
@@ -476,6 +477,53 @@ __device__ __forceinline__ float vec_dot_q4_0_q8_1(const void* __restrict__ vbq,
     }
     return __half2float(bq4->d) * __low2float(bq8_1->ds) * sumi;
 }
+// ROCmFP4: the codes go through a signed codebook, so there is no centring term; the 18-byte block's
+// two 16-weight halves carry their own UE4M3 scale and are summed separately.
+__device__ __forceinline__ float vec_dot_rocmfp4_q8_1(const void* __restrict__ vbq,
+                                                      const block_q8_1* __restrict__ bq8_1, const int& kbx,
+                                                      const int& iqs) {
+    const RocmFp4Block* bq4 = (const RocmFp4Block*) vbq + kbx;
+    int sumi0 = 0;
+    int sumi1 = 0;
+#pragma unroll
+    for (int i = 0; i < VDR_Q4_0; ++i) {
+        const int v = rocmfp4_load_i32(bq4->qs, iqs + i);
+        sumi0 = ggml_cuda_dp4a(rocmfp4_codebook_pack4(v & 0x0F0F0F0F), get_int_b4(bq8_1->qs, iqs + i), sumi0);
+        sumi1 = ggml_cuda_dp4a(rocmfp4_codebook_pack4((v >> 4) & 0x0F0F0F0F),
+                               get_int_b4(bq8_1->qs, iqs + i + QI4_0), sumi1);
+    }
+    return __low2float(bq8_1->ds) * (rocmfp4_scale(bq4->e[0]) * sumi0 + rocmfp4_scale(bq4->e[1]) * sumi1);
+}
+__device__ __forceinline__ float vec_dot_rocmfp4_fast_q8_1(const void* __restrict__ vbq,
+                                                           const block_q8_1* __restrict__ bq8_1, const int& kbx,
+                                                           const int& iqs) {
+    const RocmFp4FastBlock* bq4 = (const RocmFp4FastBlock*) vbq + kbx;
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < VDR_Q4_0; ++i) {
+        const int v = rocmfp4_load_i32(bq4->qs, iqs + i);
+        sumi = ggml_cuda_dp4a(rocmfp4_codebook_pack4(v & 0x0F0F0F0F), get_int_b4(bq8_1->qs, iqs + i), sumi);
+        sumi = ggml_cuda_dp4a(rocmfp4_codebook_pack4((v >> 4) & 0x0F0F0F0F),
+                              get_int_b4(bq8_1->qs, iqs + i + QI4_0), sumi);
+    }
+    return __low2float(bq8_1->ds) * rocmfp4_scale(bq4->e) * sumi;
+}
+// The rest of the ROCmFPX family (types 102-111): one generic dot over the family decoder in
+// strata/kernels/rocmfp4.hpp. Correct for every type; a specialized kernel would be faster.
+template <int TY>
+__device__ __forceinline__ float vec_dot_rocmfpx_family(const void* __restrict__ vbq,
+                                                        const block_q8_1* __restrict__ bq8_1, const int& kbx,
+                                                        const int& iqs) {
+    (void) iqs;
+    strata::kernels::RocmFpxFormat f{};
+    strata::kernels::rocmfpx_format(TY, f);
+    return strata::kernels::rocmfpx_block_dot(TY, (const uint8_t*) vbq + (size_t) kbx * (f.qs_bytes + f.scales),
+                                              bq8_1);
+}
+#define STRATA_FPX_FMT(TY)                                                                        \
+    template<> struct Fmt<TY> { static constexpr int qk = 32, ipb = 1, step = 0;                   \
+        __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) {       \
+            return vec_dot_rocmfpx_family<TY>(v, y, kbx, iqs); } };
 // Q4_1 (llama-quantize puts it on a few down projections of its Q4_0 files): the Q5_1 chain above without the fifth
 // bit, the same min-term choice (the activations' own int8 codes): sumi * (d4 * d8) + sumu * (m4 * d8).
 __device__ __forceinline__ float vec_dot_q4_1_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
@@ -598,6 +646,13 @@ template<> struct Fmt<7> { static constexpr int qk = 32, ipb = QI5_1 / VDR_Q5_1,
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q5_1_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<2> { static constexpr int qk = 32, ipb = QI4_0 / VDR_Q4_0, step = VDR_Q4_0;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q4_0_q8_1(v, y, kbx, iqs); } };
+// ROCmFP4 shares Q4_0's 32-element block and nibble order, so it takes the same qk/ipb/step.
+template<> struct Fmt<100> { static constexpr int qk = 32, ipb = QI4_0 / VDR_Q4_0, step = VDR_Q4_0;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_rocmfp4_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<101> { static constexpr int qk = 32, ipb = QI4_0 / VDR_Q4_0, step = VDR_Q4_0;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_rocmfp4_fast_q8_1(v, y, kbx, iqs); } };
+STRATA_FPX_FMT(102) STRATA_FPX_FMT(103) STRATA_FPX_FMT(104) STRATA_FPX_FMT(107) STRATA_FPX_FMT(108)
+STRATA_FPX_FMT(109) STRATA_FPX_FMT(110) STRATA_FPX_FMT(111)
 template<> struct Fmt<3> { static constexpr int qk = 32, ipb = QI4_1 / VDR_Q4_1, step = VDR_Q4_1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q4_1_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<6> { static constexpr int qk = 32, ipb = QI5_0 / VDR_Q5_0, step = VDR_Q5_0;
@@ -608,12 +663,14 @@ template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0,
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
 #ifdef STRATA_Q6K_EXPERTS   // opt-in build (-DSTRATA_Q6K_EXPERTS=ON): one more instance per kernel, loaded at start
-#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(14) X(6) X(2) X(3) X(8)
+// The rest of the ROCmFPX family, decoded generically (see rocmfp4.hpp): 102/103/104/107/108/109/110/111.
+#define STRATA_FPX_TYPES(X) X(102) X(103) X(104) X(107) X(108) X(109) X(110) X(111)
+#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(14) X(6) X(2) X(3) X(8) X(100) X(101) STRATA_FPX_TYPES(X)
 #else
-#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(2) X(3) X(8)
+#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(2) X(3) X(8) X(100) X(101) STRATA_FPX_TYPES(X)
 #endif
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8)
-#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8)
+#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(100) X(101) STRATA_FPX_TYPES(X)
+#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(100) X(101) STRATA_FPX_TYPES(X)
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -1792,6 +1849,52 @@ __device__ void dq_q5_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
         y[iqs + 16] = cvt<dst_t>(((float) ((x[ib].qs[iqs] >> 4) | xh_1) - 16.0f) * d);
     }
 }
+// The rest of the ROCmFPX family, decoded generically (rocmfp4.hpp). 32 threads: 8 blocks, 4 groups each.
+template<int TY, typename dst_t>
+__device__ void dq_rocmfpx_family(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    strata::kernels::RocmFpxFormat f{};
+    strata::kernels::rocmfpx_format(TY, f);
+    const int bb = f.qs_bytes + f.scales;
+    const uint8_t* x = (const uint8_t*) vx + ibs * (QK_K / 32) * bb;
+    const int ib = tid % 8, il = tid / 8;
+    const uint8_t* blk = x + (size_t) ib * bb;
+    dst_t* y = yy + 32 * ib;
+    for (int j = 0; j < 4; ++j) {
+        const int i = 4 * il + j;
+        y[i] = cvt<dst_t>((float) strata::kernels::rocmfpx_code_value(TY, strata::kernels::rocmfpx_block_code(blk, f, i)) *
+                          strata::kernels::rocmfpx_block_scale(blk, f, i));
+        y[i + 16] = cvt<dst_t>((float) strata::kernels::rocmfpx_code_value(TY, strata::kernels::rocmfpx_block_code(blk, f, i + 16)) *
+                               strata::kernels::rocmfpx_block_scale(blk, f, i + 16));
+    }
+}
+
+template<typename dst_t>
+__device__ void dq_rocmfp4(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const RocmFp4Block* x = (const RocmFp4Block*) vx + ibs * (QK_K / 32);
+    const int ib = tid % 8, il = tid / 8;
+    const float d0 = rocmfp4_scale(x[ib].e[0]);
+    const float d1 = rocmfp4_scale(x[ib].e[1]);
+    dst_t* y = yy + 32 * ib;
+    for (int j = 0; j < 4; ++j) {
+        const int iqs = 4 * il + j;
+        y[iqs] = cvt<dst_t>((float) rocmfp4_code(x[ib].qs[iqs] & 0xf) * d0);
+        y[iqs + 16] = cvt<dst_t>((float) rocmfp4_code(x[ib].qs[iqs] >> 4) * d1);
+    }
+}
+
+template<typename dst_t>
+__device__ void dq_rocmfp4_fast(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const RocmFp4FastBlock* x = (const RocmFp4FastBlock*) vx + ibs * (QK_K / 32);
+    const int ib = tid % 8, il = tid / 8;
+    const float d = rocmfp4_scale(x[ib].e);
+    dst_t* y = yy + 32 * ib;
+    for (int j = 0; j < 4; ++j) {
+        const int iqs = 4 * il + j;
+        y[iqs] = cvt<dst_t>((float) rocmfp4_code(x[ib].qs[iqs] & 0xf) * d);
+        y[iqs + 16] = cvt<dst_t>((float) rocmfp4_code(x[ib].qs[iqs] >> 4) * d);
+    }
+}
+
 template<typename dst_t>
 __device__ void dq_q4_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const block_q4_0* x = (const block_q4_0*) vx + ibs * (QK_K / QK4_0);
@@ -1891,6 +1994,16 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 7: dq_q5_1(vx, ibs, y, tid); break;
         case 6: dq_q5_0(vx, ibs, y, tid); break;
         case 2: dq_q4_0(vx, ibs, y, tid); break;
+        case 100: dq_rocmfp4(vx, ibs, y, tid); break;
+        case 101: dq_rocmfp4_fast(vx, ibs, y, tid); break;
+        case 102: dq_rocmfpx_family<102>(vx, ibs, y, tid); break;
+        case 103: dq_rocmfpx_family<103>(vx, ibs, y, tid); break;
+        case 104: dq_rocmfpx_family<104>(vx, ibs, y, tid); break;
+        case 107: dq_rocmfpx_family<107>(vx, ibs, y, tid); break;
+        case 108: dq_rocmfpx_family<108>(vx, ibs, y, tid); break;
+        case 109: dq_rocmfpx_family<109>(vx, ibs, y, tid); break;
+        case 110: dq_rocmfpx_family<110>(vx, ibs, y, tid); break;
+        case 111: dq_rocmfpx_family<111>(vx, ibs, y, tid); break;
         case 3: dq_q4_1(vx, ibs, y, tid); break;
         case 8: dq_q8_0(vx, ibs, y, tid); break;
         case 30: dq_bf16(vx, ibs, y, tid); break;
@@ -1916,6 +2029,8 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
+           t == 100 || t == 101 || t == 102 || t == 103 || t == 104 || t == 107 || t == 108 || t == 109 ||
+           t == 110 || t == 111 ||
 #ifdef STRATA_Q6K_EXPERTS
            t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 2 || t == 3 || t == 8;
 #else
@@ -2719,6 +2834,16 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 7: return (size_t) (n / 32) * sizeof(block_q5_1);
         case 6: return (size_t) (n / 32) * sizeof(block_q5_0);
         case 2: return (size_t) (n / 32) * sizeof(block_q4_0);
+        case 100: return (size_t) (n / 32) * sizeof(RocmFp4Block);
+        case 101: return (size_t) (n / 32) * sizeof(RocmFp4FastBlock);
+        case 102: return (size_t) (n / 32) * 26;
+        case 103: return (size_t) (n / 32) * 33;
+        case 104: return (size_t) (n / 32) * 14;
+        case 107: return (size_t) (n / 32) * 10;
+        case 108: return (size_t) (n / 32) * 17;
+        case 109: return (size_t) (n / 32) * 22;
+        case 110: return (size_t) (n / 32) * 30;
+        case 111: return (size_t) (n / 32) * 10;
         case 3: return (size_t) (n / 32) * sizeof(block_q4_1);
         case 8: return (size_t) (n / 32) * sizeof(block_q8_0);
         case 30: return (size_t) n * 2;   // BF16: the token embedding only (iq_embed_rows, iq_dequant_f32)
@@ -3542,11 +3667,11 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
             else native_gu_amd_kernel<T, 2><<<ggu_amd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
     // the AMD layouts cover the IQ packs' gate/up types; Unsloth's Q4_K / Q5_K take the CUDA layout below
     const bool amd_gu = L.gu_type == 16 || L.gu_type == 17 || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 ||
-                        L.gu_type == 23 || L.gu_type == 29 || L.gu_type == 42;
+                        L.gu_type == 23 || L.gu_type == 29 || L.gu_type == 42 || L.gu_type == 100 || L.gu_type == 101;
     if ((em == 1 || em == 2 || em == 4) && amd_gu) {
         switch (L.gu_type) {
             STRATA_GU_AMD(16) STRATA_GU_AMD(17) STRATA_GU_AMD(18) STRATA_GU_AMD(21) STRATA_GU_AMD(22) STRATA_GU_AMD(23)
-            STRATA_GU_AMD(29) STRATA_GU_AMD(42)
+            STRATA_GU_AMD(29) STRATA_GU_AMD(42) STRATA_GU_AMD(100) STRATA_GU_AMD(101)
         }
     } else
 #undef STRATA_GU_AMD
@@ -3599,9 +3724,10 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
             else native_down_amd_kernel<T, 2><<<gd_amd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
     // the AMD layouts cover the IQ packs' down types; the others (Unsloth's Q4_K / Q5_K / Q5_1 / Q8_0) take the
     // CUDA layout below
-    if ((em == 1 || em == 2 || em == 4) && (L.d_type == 20 || L.d_type == 23 || L.d_type == 42)) {
+    if ((em == 1 || em == 2 || em == 4) && (L.d_type == 20 || L.d_type == 23 || L.d_type == 42 ||
+                                            L.d_type == 100 || L.d_type == 101)) {
         switch (L.d_type) {
-            STRATA_D_AMD(20) STRATA_D_AMD(23) STRATA_D_AMD(42)
+            STRATA_D_AMD(20) STRATA_D_AMD(23) STRATA_D_AMD(42) STRATA_D_AMD(100) STRATA_D_AMD(101)
         }
     } else
 #undef STRATA_D_AMD

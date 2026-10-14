@@ -127,6 +127,11 @@ bool supported(int t) {
         case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_Q8_0:   // the draft layer's dense matrices (E-9)
+#ifdef STRATA_MMQ_ROCMFP4
+        case GGML_TYPE_Q4_0_ROCMFP4: case GGML_TYPE_Q4_0_ROCMFP4_FAST:   // the ROCmFPX ggml's 4-bit types
+        case GGML_TYPE_Q2_0_ROCMFPX: case GGML_TYPE_Q3_0_ROCMFPX: case GGML_TYPE_Q6_0_ROCMFPX:
+        case GGML_TYPE_Q8_0_ROCMFPX: case GGML_TYPE_Q4_0_ROCMI4:         // the rest of the family
+#endif
 #ifdef STRATA_MMQ_KQUANTS
         case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q5_1:   // Unsloth's UD-Q4_K_XL experts (CUDA)
 #if defined(__HIPCC__) || defined(STRATA_Q6K_EXPERTS)
@@ -193,11 +198,13 @@ void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
     const ggml_type t = (ggml_type) p.type;
     const int64_t qk = ggml_blck_size(t), bpr = p.w_cols / qk;
+    // This fork takes ggml from ROCmFPX, whose mmq_args ends at ncols_max; the pinned upstream
+    // revision had one more trailing field, so only one max_rows is initialized here.
     const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, nullptr,
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
                         p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
                         1, 1, 0, 0, 0,
-                        p.max_rows, p.max_rows};
+                        p.max_rows};
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
     switch (t) {
@@ -213,6 +220,15 @@ void Context::run(const Product& p, void* stream) {
         case GGML_TYPE_IQ4_NL: mul_mat_q_case<GGML_TYPE_IQ4_NL>(ctx, a, s); break;
         case GGML_TYPE_IQ4_XS: mul_mat_q_case<GGML_TYPE_IQ4_XS>(ctx, a, s); break;
         case GGML_TYPE_Q8_0: mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, a, s); break;
+#ifdef STRATA_MMQ_ROCMFP4
+        case GGML_TYPE_Q4_0_ROCMFP4: mul_mat_q_case<GGML_TYPE_Q4_0_ROCMFP4>(ctx, a, s); break;
+        case GGML_TYPE_Q4_0_ROCMFP4_FAST: mul_mat_q_case<GGML_TYPE_Q4_0_ROCMFP4_FAST>(ctx, a, s); break;
+        case GGML_TYPE_Q2_0_ROCMFPX: mul_mat_q_case<GGML_TYPE_Q2_0_ROCMFPX>(ctx, a, s); break;
+        case GGML_TYPE_Q3_0_ROCMFPX: mul_mat_q_case<GGML_TYPE_Q3_0_ROCMFPX>(ctx, a, s); break;
+        case GGML_TYPE_Q6_0_ROCMFPX: mul_mat_q_case<GGML_TYPE_Q6_0_ROCMFPX>(ctx, a, s); break;
+        case GGML_TYPE_Q8_0_ROCMFPX: mul_mat_q_case<GGML_TYPE_Q8_0_ROCMFPX>(ctx, a, s); break;
+        case GGML_TYPE_Q4_0_ROCMI4: mul_mat_q_case<GGML_TYPE_Q4_0_ROCMI4>(ctx, a, s); break;
+#endif
 #ifdef STRATA_MMQ_KQUANTS
         case GGML_TYPE_Q4_K: mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, a, s); break;
         case GGML_TYPE_Q5_K: mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, a, s); break;

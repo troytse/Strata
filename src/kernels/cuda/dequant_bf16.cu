@@ -4,6 +4,7 @@
 // The ggml authors): dequantize_row_q2_0/q4_0/q5_0/q8_0/q3_K/q4_K/q5_K/q6_K/iq4_nl/iq4_xs.
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/rocmfp4.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -50,6 +51,29 @@ __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row
             const int e = e0 + j;
             const int q = (b[2 + e / 4] >> ((e % 4) * 2)) & 3;
             put(out, j, (float) (q - 1) * d);
+        }
+    } else if constexpr (TYPE == 100) {                            // Q4_0_ROCMFP4: 18 B, one UE4M3 scale per half
+        const uint8_t* b = row_blocks + (size_t) gi_in_row * 18;
+        const float d0 = rocmfp4_scale(b[16]);
+        const float d1 = rocmfp4_scale(b[17]);
+        for (int j = 0; j < 16; ++j) {
+            put(out, j, (float) rocmfp4_code(b[j] & 0x0F) * d0);
+            put(out, j + 16, (float) rocmfp4_code(b[j] >> 4) * d1);
+        }
+    } else if constexpr (TYPE == 101) {                            // Q4_0_ROCMFP4_FAST: 17 B, one scale per block
+        const uint8_t* b = row_blocks + (size_t) gi_in_row * 17;
+        const float d = rocmfp4_scale(b[16]);
+        for (int j = 0; j < 16; ++j) {
+            put(out, j, (float) rocmfp4_code(b[j] & 0x0F) * d);
+            put(out, j + 16, (float) rocmfp4_code(b[j] >> 4) * d);
+        }
+    } else if constexpr (TYPE >= 102 && TYPE <= 111) {             // the rest of the ROCmFPX family
+        strata::kernels::RocmFpxFormat f{};
+        strata::kernels::rocmfpx_format(TYPE, f);
+        const uint8_t* b = row_blocks + (size_t) gi_in_row * (f.qs_bytes + f.scales);
+        for (int j = 0; j < 32; ++j) {
+            put(out, j, (float) strata::kernels::rocmfpx_code_value(TYPE, strata::kernels::rocmfpx_block_code(b, f, j)) *
+                        strata::kernels::rocmfpx_block_scale(b, f, j));
         }
     } else if constexpr (TYPE == 2) {                              // Q4_0
         const uint8_t* b = row_blocks + (size_t) gi_in_row * 18;
@@ -212,6 +236,16 @@ bool geometry(int type, int& block_elems, int& block_bytes) {
     case 14: block_elems = 256; block_bytes = 210; return true;
     case 23: block_elems = 256; block_bytes = 136; return true;
     case 42: block_elems = 64; block_bytes = 18; return true;
+    case 100: block_elems = 32; block_bytes = 18; return true;
+    case 101: block_elems = 32; block_bytes = 17; return true;
+    case 102: block_elems = 32; block_bytes = 26; return true;
+    case 103: block_elems = 32; block_bytes = 33; return true;
+    case 104: block_elems = 32; block_bytes = 14; return true;
+    case 107: block_elems = 32; block_bytes = 10; return true;
+    case 108: block_elems = 32; block_bytes = 17; return true;
+    case 109: block_elems = 32; block_bytes = 22; return true;
+    case 110: block_elems = 32; block_bytes = 30; return true;
+    case 111: block_elems = 32; block_bytes = 10; return true;
     default: return false;
     }
 }
@@ -250,6 +284,16 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     case 20: STRATA_DQ(20);
     case 23: STRATA_DQ(23);
     case 42: STRATA_DQ(42);
+    case 100: STRATA_DQ(100);
+    case 101: STRATA_DQ(101);
+    case 102: STRATA_DQ(102);
+    case 103: STRATA_DQ(103);
+    case 104: STRATA_DQ(104);
+    case 107: STRATA_DQ(107);
+    case 108: STRATA_DQ(108);
+    case 109: STRATA_DQ(109);
+    case 110: STRATA_DQ(110);
+    case 111: STRATA_DQ(111);
     }
 #undef STRATA_DQ
     const cudaError_t e = cudaGetLastError();

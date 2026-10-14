@@ -58,6 +58,9 @@ import gguf_reader as G  # noqa: E402
 FLOAT = {"BF16", "F32", "F16"}
 ROUTERS = ("ffn_gate_inp.weight", "ffn_gate_inp_shexp.weight")
 NOT_IN_PACK = {"per_layer_token_embd.weight"}      # the 28.8 GB PLE table: read from its GGUF by the engine
+# A ROCmFPX-quantized file splits that same table into one tensor per n-gram head; the PLE reader takes it
+# from --ple-gguf (tools/ple_rocmfpx_pack.py joins the heads back into one tensor).
+NOT_IN_PACK_PREFIX = ("ple_ngram_embd.",)
 
 # The float form the engine reads each pack tensor in (name without `blk.N.`; from eddoursul/Strata's FORM table).
 # The residual, router, GDN, QSA and PLE kernels read these small projections as BF16, the norms as F32 and the PLE
@@ -101,6 +104,36 @@ def needs_bf16(name: str, type_name: str) -> bool:
     return form_of(name) == "BF16"
 
 
+# ROCmFP4 (ggml types 100 and 101, the ROCmFPX ggml's 4-bit types): gguf-py knows their ids and sizes
+# but not their values, so the dequantizer lives here. 32 values per block; byte j holds element j in
+# its low nibble and element j+16 in its high nibble; the 4-bit code indexes a signed codebook, and
+# each scale is a finite unsigned E4M3 whose value is half the IEEE reading.
+_ROCMFP4_CODEBOOK = np.array([0, 1, 2, 3, 4, 6, 8, 10, 0, -1, -2, -3, -4, -6, -8, -10], dtype=np.float32)
+
+
+def _ue4m3_half(e: np.ndarray) -> np.ndarray:
+    e = e.astype(np.uint32)
+    ex = (e >> 3) & 0x0F
+    m = (e & 0x07).astype(np.float32)
+    scaled = np.where(ex == 0, m * np.float32(2.0 ** -10),
+                      (8.0 + m) * np.exp2((ex.astype(np.int32) - 11).astype(np.float32)))
+    return np.where(e > 0x7E, np.float32(0.0), scaled).astype(np.float32)
+
+
+def dequantize_rocmfp4(raw: np.ndarray, fast: bool) -> np.ndarray:
+    b = raw.reshape(-1, 17 if fast else 18)
+    lo = _ROCMFP4_CODEBOOK[b[:, :16] & 0x0F]      # elements 0..15
+    hi = _ROCMFP4_CODEBOOK[b[:, :16] >> 4]        # elements 16..31
+    if fast:
+        d = _ue4m3_half(b[:, 16])[:, None]
+        out = np.concatenate([lo * d, hi * d], axis=1)
+    else:
+        d0 = _ue4m3_half(b[:, 16])[:, None]
+        d1 = _ue4m3_half(b[:, 17])[:, None]
+        out = np.concatenate([lo * d0, hi * d1], axis=1)
+    return out.reshape(-1).astype(np.float32)
+
+
 def dequantize(raw: np.ndarray, type_name: str) -> np.ndarray:
     """The tensor's values as float32 (float types exactly, quantized ones through gguf-py's dequantizer)."""
     if type_name == "F32":
@@ -109,6 +142,8 @@ def dequantize(raw: np.ndarray, type_name: str) -> np.ndarray:
         return raw.view(np.float16).astype(np.float32)
     if type_name == "BF16":
         return (raw.view(np.uint16).astype(np.uint32) << 16).view(np.float32)
+    if type_name in ("Q4_0_ROCMFP4", "Q4_0_ROCMFP4_FAST"):
+        return dequantize_rocmfp4(raw, type_name == "Q4_0_ROCMFP4_FAST")
     from _paths import add_gguf_py
     add_gguf_py()
     from gguf import GGMLQuantizationType as Q, quants
@@ -119,7 +154,7 @@ def bf16_bytes(raw: np.ndarray, type_name: str) -> bytes:
     from _paths import add_gguf_py
     add_gguf_py()
     from gguf import GGMLQuantizationType as Q, quants
-    values = quants.dequantize(raw, Q[type_name])
+    values = dequantize(raw, type_name)
     if not np.isfinite(values).all():
         raise ValueError("cannot convert non-finite weights to BF16")
     # ggml's round-to-nearest-even conversion, including correct halfway rounding.
@@ -276,7 +311,7 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
     reads them (FORM; converted when stored otherwise, see above), quantized ones served natively from the GGUF."""
     todo, problems = [], []
     for name, (g, t, mm, p) in model.where.items():
-        if is_expert(t.name) or t.name in NOT_IN_PACK:
+        if is_expert(t.name) or t.name in NOT_IN_PACK or t.name.startswith(NOT_IN_PACK_PREFIX):
             continue
         if len(t.shape) > 2:
             print("tensor %s has %d dimensions; the index holds two" % (t.name, len(t.shape)))
