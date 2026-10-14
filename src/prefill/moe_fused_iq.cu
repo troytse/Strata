@@ -723,6 +723,9 @@ constexpr int NW_LB = 8;
 typedef int nw_i4 __attribute__((ext_vector_type(4)));
 typedef int nw_i2 __attribute__((ext_vector_type(2)));
 typedef int nw_i8 __attribute__((ext_vector_type(8)));
+// NW_ROWS is 128.  Halving it (to halve the weight-buffer LDS) is not available: the ALIAS instantiation's
+// static_assert wants kTileRows * 65 * 4 <= 2 * NW_ROWS * WLD, and 2 * 64 * 80 = 10240 < 64 * 260.  So the LDS
+// budget can only be moved from inside the tile shape, not from the row count alone.
 constexpr int NW_ROWS = 128;
 constexpr int NW_THREADS = 256;
 
