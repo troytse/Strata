@@ -129,8 +129,21 @@ gate/up is pinned to one resident block because 41472 B leaves no room for a sec
 LDS. **But doubling the resident blocks does not help**: the ALIAS variant really does reach two, and gate/up
 was still 3.7% SLOWER with it (2572 against 2481 ms) - the extra barrier costs more than the occupancy returns.
 This kernel is therefore **not occupancy-bound**, and neither the LDS budget nor the VGPR cap is the lever.
-What is left is the per-stage `__syncthreads()` (gate/up runs **40** 64-value stages), the ldmatrix/wmma
-dependency chain, and memory latency - all of which need the pipeline rearranged.
+
+**Do not price this kernel against a DP4A peak.** An earlier pass called it "15% of the int8 rate, 6.7x off",
+using the ~98 TOPS that `v_dot4` implies. This kernel does not execute `v_dot4`: it is `nw_wmma` + `ldmatrix`
+(16x16x16 tiles), whose int8 rate on RDNA3 is a different and much lower number. The measured figure is
+**1.29e13 MACs per chunk in 1684 ms = 7.7 TMAC/s = 15.4 TOP/s**, and how close to the WMMA issue limit that is
+has not been established here. Treat the "6.7x of peak" claim as withdrawn.
+
+The inner loop explains the occupancy results: for the types that are not `per16` - which includes Q4_K - the
+two WMMA steps are **chained**, `nw_wmma(A1, B1, nw_wmma(A0, B0, m))`, deliberately, so that only one `nw_i8`
+accumulator is live. The `per16` types (IQ2_XS / IQ2_S) use two independent WMMAs and a second accumulator. So
+trading registers for instruction-level parallelism is available, but the register file is already full (256
+VGPRs, 32 for the accumulators, 64 for the two prefetch buffers, 16 for the scales), which is why every cap in
+the 2..8 range measured worse: the compiler does not give back VGPRs, it spills. What is left is the per-stage
+`__syncthreads()` (gate/up runs **40** 64-value stages) and the dependency chain - both need the pipeline
+rearranged, not a knob.
 
 Paths already measured for gate/up, so nobody repeats them:
 
