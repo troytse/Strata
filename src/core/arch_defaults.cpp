@@ -42,18 +42,14 @@ std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gc
         {"STRATA_CVEC_FUSE", "1"},       // a steered layer's write, control vector and next norm in one pass (S23)
         {"STRATA_HCD_EXACT", "1"},       // the HC down GEMM in hipBLASLt solution 1176's k order: 64K +1.8% (stream S)
         {"STRATA_PF_PAD", "1"},          // padded GEMM row strides (acts with STRATA_PF_GEMM; inert without it) (S23)
-        // S23's fused hyper-connection down+inject GEMM.  Measured on gfx1151 with Qwen3.8-Flash-Next
-        // ROCmFP4-FAST-v2 (8192-token prompt, 3 runs each): the hc read phase 2600 -> 610 ms, the whole prompt
-        // chunk 9543 -> 8034 ms of GPU timeline (-15.8%), wall 739 -> 998 tok/s, and the decoded tokens are
-        // byte-identical.  A larger win than anything else in this table.
-        {"STRATA_PF_HCDOWN", "1"},
-        // #313's WMMA dense GEMM.  STRATA_PF_GEMM takes the S23 fused path first and this one covers the shapes
-        // that path declines, so both are needed.  Measured on gfx1151 with Qwen3.8-Flash-Next
-        // ROCmFP4-FAST-v2-ple16 (three runs each, wall clock): prompt 943.61 -> 1029.21 tok/s at 8192 tokens
-        // (+9.1%), 910.21 -> 979.96 at 4096 (+7.7%), 1007.51 -> 1064.14 at 32768 (+5.6%); decode unchanged; the
-        // decoded tokens are identical over 128 steps.  It is try-then-fall-through: when
-        // strata_wmma_gemm_f16() declines a shape the call continues to hipBLASLt as before.
-        {"STRATA_WMMA_GEMM", "1"},
+        // STRATA_PF_HCDOWN and STRATA_WMMA_GEMM are deliberately NOT here.  Both are worth a lot of prompt speed
+        // on gfx1151 (hc read 2600 -> 610 ms, -15.8% of the prompt chunk; and +5.6..+9.1% across 4K/8K/32K
+        // respectively) and both were measured on Qwen3.8-Flash-Next ROCmFP4-FAST-v2-ple16 - but neither is
+        // bitwise, and this table is only for entries that are.  Checked against this table's own entries with
+        // STRATA_DUMP_FIRST_LOGITS on the 8192-token prompt: GDN_PP 1 vs 2 and GDN_HEAD 0 vs 1 both differ in
+        // 0 of 248320 logits, while a single PF_HCDOWN flip and a single WMMA_GEMM flip each differ from the
+        // first float (WMMA_GEMM changes all 248320, by up to 1.10).  They belong with the section 5 opt-ins;
+        // docs/ROCMFP4-STRATA-FINDINGS.md section 2 sets them out with their numbers.
         // decode
         {"STRATA_Q8_PACKED", "1"},       // the packed Q8_0 decode layout: +2.3% (S26)
         {"STRATA_Q6_PACKED", "1"},       // the packed Q6_K heads (S26)

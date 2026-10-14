@@ -70,12 +70,28 @@ export STRATA_PF_FUSED_FPX=1    # ROCmFPX down coverage (new code, see 3)
 export STRATA_PF_GEMM=1         # WMMA dense GEMM instead of hipBLASLt      -45% of the chunk
 export STRATA_HIP_WMMA=1        # prompt attention on matrix cores          -6.3%
 export STRATA_HC_UPMIX=1        # hyper-connection upmix                    -6.5%
-# gfx1151's default table now also carries STRATA_PF_HCDOWN (see 3b)       -16%
-# and #313's STRATA_WMMA_GEMM (see 3d)                          +5.6..+9.1%
+export STRATA_PF_HCDOWN=1       # fused hyper-connection down + inject      -16%   (3b)
+export STRATA_WMMA_GEMM=1       # #313's WMMA dense GEMM, beside PF_GEMM    +5.6..+9.1% (3d)
 ```
 
 `STRATA_PF_GEMM` and `STRATA_WMMA_GEMM` are **both** needed: the S23 fused path runs first and returns, and
 the WMMA one covers the shapes that path declines, falling through to hipBLASLt when it declines them too.
+
+**`STRATA_PF_HCDOWN` and `STRATA_WMMA_GEMM` are exports here, not entries in gfx1151's default table.** They
+were briefly in that table and were taken out again, because neither is bitwise and that table is only for
+entries that are. Checked with `STRATA_DUMP_FIRST_LOGITS` on the 8192-token prompt, against that table's own
+entries as a control:
+
+| flip | logits differing |
+| --- | --- |
+| `STRATA_GDN_PP` 1 against 2 (a table entry) | **0 of 248320** |
+| `STRATA_GDN_HEAD` 0 against 1 (a table entry) | **0 of 248320** |
+| `STRATA_PF_HCDOWN` 0 against 1 | differs from the first float |
+| `STRATA_WMMA_GEMM` 0 against 1 | **all 248320**, by up to 1.10 |
+
+So the table's "Exact (bitwise)" heading is not aspirational - its real entries pass a logit-for-logit test and
+these two do not. The earlier "byte-identical tokens" claim for both was a token-level check, which is weaker:
+128 greedy tokens happened to match, but the logits underneath them do not.
 
 Also required, and outside the switches: `--ple-io mmap` (page cache; `direct` costs 23% of decode),
 `--expert-cache auto`, `--mtp <rt dir>`, `--mtp-draft-vocab data/draft_vocab.bin` (+6.7% decode),
