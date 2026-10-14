@@ -30,6 +30,24 @@ The 4K and 32K references are the community arm, the 8K one is the maintainers';
 depths. The two sources disagree by ~10% with each other (the maintainers' 128K reads 1,299 where the community
 one reads 1,108.6), so read the 8K cell as the least comparable of the three.
 
+**Those rows compare a heavier model against a lighter one's reference.** This file's model is
+`ROCmFP4-FAST-v2-ple16`, whose expert gate/up is **Q4_K at 4.5 bpw**; every reference above was measured on
+**UD-IQ4_XS**, whose gate/up is **IQ3_S at 3.4 bpw** - about 30% fewer weight bytes. Run the reference model
+itself, with the official fast configuration, on this machine and the picture changes:
+
+| depth | UD-IQ4_XS here | reference | vs reference | decode here | reference | vs reference |
+| --- | --- | --- | --- | --- | --- | --- |
+| 4K | **1,091.98 tok/s** | 808.5 | **135%** | **89.11 tok/s** | 40.1 | **222%** |
+| 8K | **1,154.39 tok/s** | 1,159 | **99.6%** | **88.75 tok/s** | 53.14 | **167%** |
+| 32K | **1,203.37 tok/s** | 1,165.4 | **103%** | **84.06 tok/s** | 49.6 | **169%** |
+
+Same three-shard UD-IQ4_XS (`llama-gguf-split --merge`; 93,682,584,000 bytes against the community run's
+93,682,584,224), packed with `tools/iq_pack.py --compat-bf16`, the nine section 5 switches plus
+`STRATA_PREFILL_STREAM_MIN=128`, `--lookup-chain 3 --mtp-q4 all --prefill 16384 --spec 4 --spec-min-p 0.5
+--kv int8`, three runs each. **On the reference model this port reaches the published speed**: 99.6% at the one
+depth the maintainers publish, 103% at the community one, and 1.35x at 4K. The residual on this file's own
+model is therefore a model-weight difference, not an engine one.
+
 Three runs each. Decode is quoted from a **128-token** generation; a 256-token one reads a few percent higher
 and a 32-token one 6-10% lower, because the warm-up is a fixed cost - enough to turn a 6% configuration effect
 into a wrong answer, which is how `STRATA_WMMA_GEMM` came to be rejected once (section 5).
