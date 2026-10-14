@@ -11,11 +11,24 @@ All numbers below are wall clock on this machine unless a GPU timeline is named,
 Decode is quoted from a **256-token** generation; a 32-token one reads 6-10% lower because of warm-up, which is
 easy to mistake for a configuration effect.
 
-| depth | prefill | official "fast" | vs official | decode | official | vs official | vs ROCmFPX |
+The reference numbers below come from **two places, and they must be matched by context depth** - an earlier
+pass of this document compared its 32K against the maintainers' **128K** figure by mistake and understated the
+result by 8 points:
+
+- `docs/STRIX_HALO.md` section 6, the **re-measured merged 0.1.40** row (no environment switches): UD-IQ4_XS at
+  **8K = 1,159 prompt / 53.14 output**; at 128K = 1,299 / 50.72.
+- `Strata/bench/results/2026-10-09-community-gfx1151-ud-iq4xs-0.1.41/` (a gfx1151 community run of v0.1.41 on
+  the same UD-IQ4_XS), fast arm: **4,096 = 808.5 / 40.1**, **32,768 = 1,165.4 / 49.6**, 128,000 = 1,108.6 / 47.5.
+
+| depth | prefill | reference | vs reference | decode | reference | vs reference | vs ROCmFPX |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 4K | **959.78 tok/s** | 808.5 | **119%** | **66.21 tok/s** | ~50 | **132%** | 2.37x |
-| 8K | **1038.78 tok/s** | 1159 | **90%** | **65.45 tok/s** | 53.14 | **123%** | 2.66x |
-| 32K | **1066.27 tok/s** | 1290 | **83%** | **64.65 tok/s** | 50.91 | **127%** | 3.27x |
+| 4K | **959.78 tok/s** | 808.5 | **119%** | **66.21 tok/s** | 40.1 | **165%** | 2.37x |
+| 8K | **1038.78 tok/s** | 1,159 | **90%** | **65.45 tok/s** | 53.14 | **123%** | 2.66x |
+| 32K | **1066.27 tok/s** | 1,165.4 | **91.5%** | **64.65 tok/s** | 49.6 | **130%** | 3.27x |
+
+The 4K and 32K references are the community arm, the 8K one is the maintainers'; neither publishes all three
+depths. The two sources disagree by ~10% with each other (the maintainers' 128K reads 1,299 where the community
+one reads 1,108.6), so read the 8K cell as the least comparable of the three.
 
 Three runs each. Decode is quoted from a **128-token** generation; a 256-token one reads a few percent higher
 and a 32-token one 6-10% lower, because the warm-up is a fixed cost - enough to turn a 6% configuration effect
