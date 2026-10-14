@@ -183,3 +183,24 @@ WMMA dense path `STRATA_PF_GEMM` already turns on.
 they are opt-ins for a reason, and enabling them for very short prompts changes numerics the maintainers chose
 to keep. `STRATA_PF_HCDOWN` was promoted to a default instead because it is not one of those switches and its
 output is byte-identical.
+
+## 7. Landing this branch
+
+The work is on `fork/rocmfpx-family` (seven commits on top of `a0116b27`). Merging it into the fork's current
+`main`, which is 282 upstream commits ahead (0.1.44.1), conflicts in **two files, four blocks**:
+
+| file | what collides |
+| --- | --- |
+| `src/kernels/cuda/iq_kernels.cu` | upstream added NVFP4 (type 40) to `STRATA_GU_FMTS` / `STRATA_D_FMTS` / `STRATA_MMVQ_FMTS`; this branch added 100/101 and the family. Keep both. |
+| `src/prefill/moe_mmq.cu` | upstream added Q6_K / the dense paths to the MMQ support list; this branch added the ROCmFPX family. Keep both. |
+
+The other 15 files merge cleanly. The resolution is mechanical, **but it must be followed by a rebuild and a
+re-verification**: both sides are compile-time macro lists, so a dropped type does not fail the build - it takes
+a silent wrong branch at run time, which is exactly how a missing `STRATA_NW_D` case decoded this model to
+zeros. Everything in this document was measured on `a0116b27`, not on those 282 commits.
+
+Suggested order: merge, resolve the four blocks keeping both sides, build, run `native_expert_parity` and
+`hip_prefill_mmq_parity`, then a 64-token `--tokens-file` run compared against the token ids in section 3a.
+
+The two `docs/` files added by this branch are this document and nothing else; the code changes are the three
+in section 3 plus the four diagnostics named in 3c and 4a.
