@@ -1238,6 +1238,17 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
         const uint8_t* xa8 = (const uint8_t*) xa;
         uint8_t* ha8 = (uint8_t*) ha;
 #define STRATA_NW_GU(T) do { if (occ_gu) native_w11_kernel<T, true, true, NW_LB><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, nullptr); else native_w11_kernel<T, true><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, nullptr); } while (0)
+        // Diagnostics (STRATA_PF_SPLIT_TIMING=1): this call is one experts_native() that issues the gate/up kernel
+        // and then the down one, so the phase timer cannot separate them.  These events do, accumulated - the last
+        // line of a chunk carries the whole chunk's split.  The events serialize the two halves, so the numbers are
+        // a breakdown, not a fast-run measurement (STRATA_PF_STEP_SYNC has the same caveat).
+        static const bool split_timing = std::getenv("STRATA_PF_SPLIT_TIMING") != nullptr;
+        static double gu_ms = 0.0, d_ms = 0.0;
+        cudaEvent_t te0 = nullptr, te1 = nullptr, te2 = nullptr;
+        if (split_timing) {
+            cudaEventCreate(&te0); cudaEventCreate(&te1); cudaEventCreate(&te2);
+            cudaEventRecord(te0, s);
+        }
         switch (g.gu_type) {
             case T_IQ2_XXS: STRATA_NW_GU(T_IQ2_XXS); break;
             case T_IQ2_XS: STRATA_NW_GU(T_IQ2_XS); break;
@@ -1249,6 +1260,7 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
             default: STRATA_NW_GU(T_IQ4_XS); break;
         }
 #undef STRATA_NW_GU
+        if (split_timing) cudaEventRecord(te1, s);
 #define STRATA_NW_D(T) do { if (occ_d) native_w11_kernel<T, false, true, NW_LB><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); else native_w11_kernel<T, false><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); } while (0)
         if (g.d_type == T_Q2_0) STRATA_NW_D(T_Q2_0);
         else if (g.d_type == T_Q4_0_ROCMFP4_FAST) STRATA_NW_D(T_Q4_0_ROCMFP4_FAST);
@@ -1257,6 +1269,16 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
         else if (g.d_type == T_Q8_0) STRATA_NW_D(T_Q8_0);
         else STRATA_NW_D(T_IQ4_NL);
 #undef STRATA_NW_D
+        if (split_timing) {
+            cudaEventRecord(te2, s);
+            cudaEventSynchronize(te2);
+            float a = 0.0f, bb = 0.0f;
+            cudaEventElapsedTime(&a, te0, te1);
+            cudaEventElapsedTime(&bb, te1, te2);
+            gu_ms += a; d_ms += bb;
+            std::fprintf(stderr, "prefill fused split: gate/up %.1f ms, down %.1f ms (cumulative)\n", gu_ms, d_ms);
+            cudaEventDestroy(te0); cudaEventDestroy(te1); cudaEventDestroy(te2);
+        }
         ck(cudaGetLastError(), "experts_native");
         return;
     }
